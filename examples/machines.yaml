@@ -1,0 +1,31 @@
+machines:
+  spark-1:
+    host: spark-1.local
+    user: agora
+    port: 22
+    password: REPLACE_LOCALLY
+    key_path: null
+    sudo_password: REPLACE_LOCALLY
+    shutdown_command: "sudo -S -p '' poweroff"
+    plug_entity_id: switch.spark_1 #within home assistant
+
+  spark-2:
+    host: spark-2.local
+    user: agora
+    password: REPLACE_LOCALLY
+    sudo_password: REPLACE_LOCALLY
+    plug_entity_id: switch.spark_2
+
+  spark-3:
+    host: spark-3.local
+    user: agora
+    password: REPLACE_LOCALLY
+    sudo_password: REPLACE_LOCALLY
+    plug_entity_id: switch.spark_3
+
+  spark-4:
+    host: spark-4.local
+    user: agora
+    password: REPLACE_LOCALLY
+    sudo_password: REPLACE_LOCALLY
+    plug_entity_id: switch.spark_4

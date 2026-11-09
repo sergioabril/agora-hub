@@ -1,0 +1,13 @@
+deployments:
+  pro:
+    name: Pro
+    machines: [spark-1, spark-2, spark-3, spark-4]
+    head: spark-1
+    working_directory: /home/agora/pro
+    start_command: bash start.sh
+    stop_command: bash stop.sh
+    status_command: bash status.sh # optional; omit or set null for HTTP-only checks
+    endpoint: http://spark-1.local:8000
+    readiness:
+      path: /v1/models
+      expected_status: 200

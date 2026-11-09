@@ -1,0 +1,32 @@
+api:
+  host: 127.0.0.1
+  port: 3333
+  admin_token_env: AGORA_HUB_ADMIN_TOKEN
+
+ssh:
+  known_hosts_path: known_hosts
+
+home_assistant:
+  base_url: http://homeassistant.local:8123
+  token_env: HOME_ASSISTANT_TOKEN
+  turn_off_path: /api/services/switch/turn_off
+  turn_on_path: /api/services/switch/turn_on
+  power_cycle_delay_seconds: 5
+
+schedule:
+  enabled: true
+  timezone: Europe/Madrid
+  wake_at: "08:00"
+  shutdown_at: "23:00"
+  machines: [spark-1, spark-2, spark-3, spark-4]
+  startup_deployment: pro # null: wake machines without starting a model
+
+timeouts:
+  ssh_connect_seconds: 10
+  status_command_seconds: 10
+  http_seconds: 10
+  machine_boot_seconds: 180
+  machine_shutdown_seconds: 120
+  deployment_start_seconds: 900
+  deployment_stop_seconds: 60
+  readiness_poll_seconds: 5
