@@ -140,8 +140,13 @@ class Controller:
     async def machines_status(self) -> dict:
         await asyncio.gather(*(self._observe_machine(key) for key in self.config.machines))
         machines = {
-            key: {**self.machine_observations[key], "operation": self._operation(self.machine_operations.get(key))}
-            for key in self.config.machines
+            key: {
+                "host": machine.host,
+                "device": machine.device,
+                **self.machine_observations[key],
+                "operation": self._operation(self.machine_operations.get(key)),
+            }
+            for key, machine in self.config.machines.items()
         }
         return {"machines": machines, "active": self.active}
 
@@ -152,6 +157,8 @@ class Controller:
             deployments[key] = {
                 "name": deployment.name,
                 "endpoint": str(deployment.endpoint),
+                "machines": list(deployment.machines),
+                "head": deployment.head,
                 **self.deployment_observations[key],
                 "operation": self._operation(self.deployment_operations.get(key)),
             }

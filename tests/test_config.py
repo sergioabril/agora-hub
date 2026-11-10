@@ -12,6 +12,7 @@ def test_valid_config_loads(config_dir: Path):
     assert config.hub.api.port == 3333
     assert config.machines["spark-2"].port == 22
     assert config.machines["spark-2"].key_path is None
+    assert config.machines["spark-2"].device == "dgx-spark"
     assert config.deployments["pro"].status_command == "bash status.sh"
     assert config.hub.ssh.known_hosts_path == config_dir / "known_hosts"
 
@@ -28,6 +29,7 @@ def test_valid_config_loads(config_dir: Path):
         ("hub.yaml", lambda data: data["timeouts"].update(http_seconds=0)),
         ("machines.yaml", lambda data: data["machines"]["spark-1"].update(password=None, key_path=None)),
         ("machines.yaml", lambda data: data["machines"].update({"Bad ID": data["machines"]["spark-1"]})),
+        ("machines.yaml", lambda data: data["machines"]["spark-1"].update(device="toaster")),
         ("hub.yaml", lambda data: data["api"].update(unknown=True)),
     ],
 )

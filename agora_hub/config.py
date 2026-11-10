@@ -1,6 +1,7 @@
 import os
 import re
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -91,6 +92,7 @@ class MachineConfig(Model):
     sudo_password: SecretStr | None = Field(default=None, repr=False)
     shutdown_command: str = "sudo -S -p '' poweroff"
     plug_entity_id: str
+    device: Literal["dgx-spark", "rtx6000", "mac-studio"] = "dgx-spark"
 
     @model_validator(mode="after")
     def has_authentication(self):

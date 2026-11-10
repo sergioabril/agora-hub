@@ -8,6 +8,7 @@ machines:
     sudo_password: REPLACE_LOCALLY
     shutdown_command: "sudo -S -p '' poweroff"
     plug_entity_id: switch.spark_1 #within home assistant
+    device: dgx-spark # dgx-spark (default) | rtx6000 | mac-studio; selects dashboard art
 
   spark-2:
     host: spark-2.local

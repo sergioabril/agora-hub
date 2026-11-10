@@ -61,7 +61,7 @@ timeouts:
   readiness_poll_seconds: 5
 ```
 
-`machines.yaml` (defaults: port `22`, `key_path: null`, and `shutdown_command: "sudo -S -p '' poweroff"`; configure either `password` or `key_path`):
+`machines.yaml` (defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
 
 ```yaml
 machines:
@@ -71,6 +71,7 @@ machines:
     password: REPLACE_LOCALLY
     sudo_password: REPLACE_LOCALLY
     plug_entity_id: switch.spark_1
+    device: dgx-spark
 ```
 
 `deployments.yaml`:
@@ -116,9 +117,9 @@ All endpoints require `Authorization: Bearer <admin-token>`.
 
 | Method and path | Body | What it does |
 | --- | --- | --- |
-| `GET /admin/machines/status` | None | Refreshes machine observations without mutations. |
+| `GET /admin/machines/status` | None | Refreshes machine observations (with each machine's `host` and `device`) without mutations. |
 | `POST /admin/machines/{machine_id}` | `{"action":"on"}` or `{"action":"off"}` | Starts an independent machine action; returns `202`, or `409` when blocked. |
-| `GET /admin/deployments/status` | None | Refreshes deployment state, readiness, endpoint, and operation status without mutations. |
+| `GET /admin/deployments/status` | None | Refreshes deployment state, readiness, endpoint, member `machines`, `head`, and operation status without mutations. |
 | `POST /admin/deployments/{deployment_id}` | `{"action":"start"}` or `{"action":"stop"}` | Starts an independent deployment action; returns `202`, or `409` when blocked. |
 
 ```sh
