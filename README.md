@@ -28,12 +28,14 @@ make deploy
 
 `make deploy` creates `~/.config/agora/agora-hub/` (and any missing parent folder) and adds only the files that are missing; it never overwrites existing ones:
 
-- `hub.yaml`: a copy of `examples/hub.yaml` with a freshly generated `api.admin_token`, no scheduled machines and no startup deployment
+- `hub.yaml`: a copy of `examples/hub.yaml` with an empty `api.admin_token` (no authentication, see below), no scheduled machines and no startup deployment
 - `machines.yaml`: `machines: {}`
 - `deployments.yaml`: `deployments: {}`
 - `known_hosts`: empty
 
 It then builds the image and starts the hub in the background on port `3333`, with the config folder mounted writable so the add and update endpoints can save machines. The container uses `--restart unless-stopped`, so it comes back after a crash, a Docker restart or a reboot (on macOS, enable Docker Desktop's "Start when you sign in"). Run `make deploy` again to rebuild and replace it; nothing in the config folder is overwritten. Use `make deploy CONFIG_DIR=/other/path` for a different folder.
+
+> **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`).
 
 After the first deploy, replace `home_assistant.token` in `hub.yaml` with your Home Assistant token, add host keys with `ssh-keyscan -H <host> >> ~/.config/agora/agora-hub/known_hosts`, and add machines through `POST /admin/machines/add`. `known_hosts` is read on every SSH connection; after editing a YAML file by hand, run `docker restart agora-hub`.
 
@@ -41,10 +43,10 @@ Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
 
 ## 3. Config files
 
-`hub.yaml` (secrets live in the YAML files, like the machine passwords: `api.admin_token` is 64 hex characters from `openssl rand -hex 32`, `home_assistant.token` is a Home Assistant long-lived access token):
+`hub.yaml` (secrets live in the YAML files, like the machine passwords: `api.admin_token` is empty (no authentication) or 64 hex characters from `openssl rand -hex 32`, which every request must then send as `Authorization: Bearer <token>`; `home_assistant.token` is a Home Assistant long-lived access token):
 
 ```yaml
-api: {host: 127.0.0.1, port: 3333, admin_token: "64_HEX_CHARACTERS"}
+api: {host: 127.0.0.1, port: 3333, admin_token: ""}
 ssh: {known_hosts_path: known_hosts}
 home_assistant:
   base_url: http://homeassistant.local:8123
@@ -100,7 +102,7 @@ deployments:
     readiness: {path: /v1/models, expected_status: 200}
 ```
 
-For a native run, set up the owner-only configuration directory and required `known_hosts` file by hand (`make deploy` does this for Docker), then set `api.admin_token` and `home_assistant.token` in `hub.yaml`:
+For a native run, set up the owner-only configuration directory and required `known_hosts` file by hand (`make deploy` does this for Docker), then set `home_assistant.token` (and, to enforce authentication, `api.admin_token`) in `hub.yaml`:
 
 ```sh
 CONFIG_DIR="$HOME/.config/agora/agora-hub"
@@ -114,7 +116,7 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 
 ## 4. Endpoint calls
 
-All endpoints require `Authorization: Bearer <admin-token>`. Add and update apply immediately (no restart) and rewrite `machines.yaml`, which drops its YAML comments.
+When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <admin-token>` and answers `401` otherwise; when it is empty, no endpoint checks authentication. Add and update apply immediately (no restart) and rewrite `machines.yaml`, which drops its YAML comments.
 
 | Method and path | Body | What it does |
 | --- | --- | --- |

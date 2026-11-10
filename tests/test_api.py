@@ -45,6 +45,20 @@ async def test_auth_precedes_validation_and_only_six_routes(api):
     assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 6
 
 
+async def test_empty_admin_token_disables_auth(config_dir):
+    path = config_dir / "hub.yaml"
+    hub = yaml.safe_load(path.read_text())
+    hub["api"]["admin_token"] = ""
+    path.write_text(yaml.safe_dump(hub))
+    config = load_config(config_dir)
+    app = create_app(config, Controller(config, FakeAdapters()))
+    async with client(app) as request:
+        none = await request.get("/admin/deployments/status")
+        anything = await request.get("/admin/deployments/status", headers={"Authorization": "Bearer whatever"})
+    assert config.hub.api.admin_token is None
+    assert none.status_code == anything.status_code == 200
+
+
 async def test_invalid_ids_and_actions(api):
     _, _, _, app, headers = api
     async with client(app) as request:

@@ -1,7 +1,7 @@
 api:
   host: 127.0.0.1
   port: 3333
-  admin_token: REPLACE_WITH_64_HEX_CHARACTERS # openssl rand -hex 32
+  admin_token: "" # empty = NO authentication; set 64 hex chars (openssl rand -hex 32) to enforce it
 
 ssh:
   known_hosts_path: known_hosts

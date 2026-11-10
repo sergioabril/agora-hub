@@ -10,8 +10,7 @@ build:
 deploy: build
 	@set -e; umask 077; dir="$(CONFIG_DIR)"; \
 	mkdir -p "$$dir"; chmod 700 "$$dir"; \
-	[ -e "$$dir/hub.yaml" ] || sed -e "s/^  admin_token: .*/  admin_token: \"$$(openssl rand -hex 32)\"/" \
-	  -e 's/^  machines: .*/  machines: []/' \
+	[ -e "$$dir/hub.yaml" ] || sed -e 's/^  machines: .*/  machines: []/' \
 	  -e 's/^  startup_deployment: .*/  startup_deployment: null/' examples/hub.yaml > "$$dir/hub.yaml"; \
 	[ -e "$$dir/machines.yaml" ] || echo 'machines: {}' > "$$dir/machines.yaml"; \
 	[ -e "$$dir/deployments.yaml" ] || echo 'deployments: {}' > "$$dir/deployments.yaml"; \

@@ -26,13 +26,15 @@ class Model(BaseModel):
 class APIConfig(Model):
     host: str
     port: int = 3333
-    admin_token: SecretStr = Field(repr=False)
+    admin_token: SecretStr | None = Field(default=None, repr=False)
 
     @field_validator("admin_token")
     @classmethod
-    def hex_token(cls, value: SecretStr) -> SecretStr:
+    def hex_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value():
+            return None
         if not re.fullmatch(r"[0-9a-fA-F]{64}", value.get_secret_value()):
-            raise ValueError("must contain 64 hex characters")
+            raise ValueError("must be empty or contain 64 hex characters")
         return value
 
 
