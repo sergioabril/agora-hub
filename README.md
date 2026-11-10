@@ -26,7 +26,7 @@ Docker:
 make build
 docker run --rm --name agora-hub \
   --publish 3333:3333 \
-  --mount type=bind,src="$HOME/.config/agora/agora-hub",dst=/config,readonly \
+  --mount type=bind,src="$HOME/.config/agora/agora-hub",dst=/config \
   agora-hub:local
 ```
 
@@ -61,11 +61,12 @@ timeouts:
   readiness_poll_seconds: 5
 ```
 
-`machines.yaml` (defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
+`machines.yaml` (each key is the machine id: ids must be unique, the hub generates them for machines added through the API, and `add` is reserved; `name` is required and is the label people see; defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
 
 ```yaml
 machines:
   spark-1:
+    name: Spark 1
     host: spark-1.local
     user: agora
     password: REPLACE_LOCALLY
@@ -113,11 +114,13 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,.env,known_host
 
 ## 4. Endpoint calls
 
-All endpoints require `Authorization: Bearer <admin-token>`.
+All endpoints require `Authorization: Bearer <admin-token>`. Add and update apply immediately (no restart) and rewrite `machines.yaml`, which drops its YAML comments.
 
 | Method and path | Body | What it does |
 | --- | --- | --- |
-| `GET /admin/machines/status` | None | Refreshes machine observations (with each machine's `host` and `device`) without mutations. |
+| `GET /admin/machines/status` | None | Refreshes machine observations (with each machine's `name`, `host` and `device`) without mutations. |
+| `POST /admin/machines/add` | Machine fields (`name`, `host`, `user`, ...) | Adds a machine with a hub-generated 8-hex id; returns `201` with the machine (no passwords), or `422`. |
+| `POST /admin/machines/{machine_id}/update` | Any subset of machine fields; `null` resets one to its default | Updates a machine; returns `200`, `404`, `409` (`machine_busy`), or `422`. |
 | `POST /admin/machines/{machine_id}` | `{"action":"on"}` or `{"action":"off"}` | Starts an independent machine action; returns `202`, or `409` when blocked. |
 | `GET /admin/deployments/status` | None | Refreshes deployment state, readiness, endpoint, member `machines`, `head`, and operation status without mutations. |
 | `POST /admin/deployments/{deployment_id}` | `{"action":"start"}` or `{"action":"stop"}` | Starts an independent deployment action; returns `202`, or `409` when blocked. |
@@ -127,6 +130,11 @@ TOKEN=your-64-character-token
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/machines/status
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"on"}' http://localhost:3333/admin/machines/spark-1
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Spark 5","host":"spark-5.local","user":"agora","password":"...","plug_entity_id":"switch.spark_5"}' \
+  http://localhost:3333/admin/machines/add
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"host":"10.0.0.5"}' http://localhost:3333/admin/machines/spark-1/update
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/status
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"start"}' http://localhost:3333/admin/deployments/pro

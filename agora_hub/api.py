@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from .config import Config
+from .config import Config, ConfigError, save_machine
 from .controller import Conflict, Controller
 from .schedule import run_schedule
 
@@ -55,6 +55,26 @@ def create_app(config: Config, controller: Controller) -> FastAPI:
     @app.get("/admin/machines/status")
     async def machines_status():
         return await controller.machines_status()
+
+    def save(machine_id: str | None, body: dict) -> dict:
+        try:
+            return save_machine(config, machine_id, body)
+        except ConfigError as error:
+            raise HTTPException(422, str(error)) from error
+        except OSError as error:
+            raise HTTPException(500, "cannot write machines.yaml") from error
+
+    @app.post("/admin/machines/add", status_code=201)
+    async def add_machine(body: dict):
+        return save(None, body)
+
+    @app.post("/admin/machines/{machine_id}/update")
+    async def update_machine(machine_id: str, body: dict):
+        if machine_id not in config.machines:
+            raise HTTPException(404, "Machine not found")
+        if controller.active and machine_id in controller.active["machines"]:
+            raise Conflict("machine_busy", "machine has an active operation", dict(controller.active))
+        return save(machine_id, body)
 
     @app.post("/admin/machines/{machine_id}", status_code=202)
     async def machine_action(machine_id: str, body: MachineAction):

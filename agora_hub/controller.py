@@ -97,7 +97,7 @@ class Controller:
             "reachable": reachable,
             "error": error,
             "checked_at": _now(),
-            "shutdown_requested": self.shutdown_requested[machine_id],
+            "shutdown_requested": self.shutdown_requested.get(machine_id, False),
         }
         self.machine_observations[machine_id] = observation
         return observation
@@ -141,6 +141,7 @@ class Controller:
         await asyncio.gather(*(self._observe_machine(key) for key in self.config.machines))
         machines = {
             key: {
+                "name": machine.name,
                 "host": machine.host,
                 "device": machine.device,
                 **self.machine_observations[key],

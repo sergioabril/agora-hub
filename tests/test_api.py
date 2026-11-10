@@ -1,6 +1,8 @@
 import asyncio
+import re
 
 import httpx
+import yaml
 import pytest
 
 from agora_hub.adapters import AdapterError
@@ -30,7 +32,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_four_routes(api):
+async def test_auth_precedes_validation_and_only_six_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
@@ -40,7 +42,7 @@ async def test_auth_precedes_validation_and_only_four_routes(api):
     assert missing.status_code == wrong.status_code == 401
     assert right.status_code == 200
     assert all(response.status_code == 404 for response in hidden)
-    assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 4
+    assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 6
 
 
 async def test_invalid_ids_and_actions(api):
@@ -153,3 +155,56 @@ async def test_new_controller_has_no_operation_memory(api):
     async with client(fresh_app) as request:
         status = await request.get("/admin/machines/status", headers=headers)
     assert all(machine["operation"] is None for machine in status.json()["machines"].values())
+
+
+NEW_MACHINE = {"name": "Studio", "host": "studio.local", "user": "agora", "password": "hunter2-secret",
+               "plug_entity_id": "switch.studio", "device": "mac-studio"}
+
+
+async def test_add_machine_writes_file_and_status(api):
+    config, _, controller, app, headers = api
+    async with client(app) as request:
+        added = await request.post("/admin/machines/add", json=NEW_MACHINE, headers=headers)
+        status = await request.get("/admin/machines/status", headers=headers)
+        with_id = await request.post("/admin/machines/add", json={**NEW_MACHINE, "id": "x"}, headers=headers)
+        no_name = {key: value for key, value in NEW_MACHINE.items() if key != "name"}
+        nameless = await request.post("/admin/machines/add", json=no_name, headers=headers)
+    assert added.status_code == 201
+    machine_id = added.json()["id"]
+    assert re.fullmatch(r"[0-9a-f]{8}", machine_id)
+    assert "password" not in added.json() and added.json()["port"] == 22
+    stored = yaml.safe_load((config.config_dir / "machines.yaml").read_text())["machines"]
+    assert stored[machine_id] == NEW_MACHINE
+    assert status.json()["machines"][machine_id]["name"] == "Studio"
+    assert with_id.status_code == nameless.status_code == 422
+    assert "hunter2-secret" not in with_id.text + nameless.text
+    await controller.close()
+
+
+async def test_update_machine_merges_onto_file(api):
+    config, _, _, app, headers = api
+    async with client(app) as request:
+        updated = await request.post("/admin/machines/spark-2/update", json={"host": "10.0.0.2"}, headers=headers)
+        null_name = await request.post("/admin/machines/spark-2/update", json={"name": None}, headers=headers)
+        empty_name = await request.post("/admin/machines/spark-2/update", json={"name": " "}, headers=headers)
+        missing = await request.post("/admin/machines/missing/update", json={"host": "x"}, headers=headers)
+    assert updated.status_code == 200
+    assert updated.json()["host"] == config.machines["spark-2"].host == "10.0.0.2"
+    stored = yaml.safe_load((config.config_dir / "machines.yaml").read_text())["machines"]["spark-2"]
+    assert stored["host"] == "10.0.0.2" and stored["password"] == "REPLACE_LOCALLY"
+    assert null_name.status_code == empty_name.status_code == 422
+    assert config.machines["spark-2"].name == "Spark 2"
+    assert missing.status_code == 404
+
+
+async def test_update_busy_machine_conflicts(api):
+    _, adapters, controller, app, headers = api
+    held = asyncio.Event()
+    adapters.delays[("wake", "spark-1")] = held
+    async with client(app) as request:
+        started = await request.post("/admin/machines/spark-1", json={"action": "on"}, headers=headers)
+        busy = await request.post("/admin/machines/spark-1/update", json={"host": "x"}, headers=headers)
+    held.set()
+    await controller.task
+    assert started.status_code == 202
+    assert busy.status_code == 409 and busy.json()["detail"]["code"] == "machine_busy"

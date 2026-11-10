@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -12,6 +13,7 @@ from pydantic import ValidationError, constr, field_validator, model_validator
 ConfigId = constr(pattern=r"^[a-z0-9][a-z0-9_-]*$")
 HubTime = constr(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 ReadinessPath = constr(pattern=r"^/")
+MachineName = constr(strip_whitespace=True, min_length=1)
 
 
 class ConfigError(Exception):
@@ -84,6 +86,7 @@ class HubConfig(Model):
 
 
 class MachineConfig(Model):
+    name: MachineName
     host: str
     user: str
     port: int = 22
@@ -134,6 +137,8 @@ class Config(Model):
         for machine in self.machines.values():
             machine.key_path = self.config_dir / machine.key_path if machine.key_path else None
         machine_ids = set(self.machines)
+        if "add" in machine_ids:
+            raise ValueError("machine id add is reserved")
         schedule = self.hub.schedule
         if unknown := set(schedule.machines) - machine_ids:
             raise ValueError(f"unknown schedule machine: {sorted(unknown)[0]}")
@@ -151,9 +156,17 @@ class Config(Model):
         return self
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+        if duplicates := [key for key in keys if keys.count(key) > 1]:
+            raise yaml.YAMLError(f"duplicate key {duplicates[0]!r}")
+        return super().construct_mapping(node, deep=deep)
+
+
 def _read_yaml(path: Path) -> dict:
     try:
-        value = yaml.safe_load(path.read_text())
+        value = yaml.load(path.read_text(), Loader=_UniqueKeyLoader)
     except (OSError, yaml.YAMLError) as error:
         raise ConfigError(f"cannot load {path.name}: {error}") from error
     if not isinstance(value, dict):
@@ -180,8 +193,39 @@ def load_config(config_dir: Path) -> Config:
             **machines_yaml, **deployments_yaml,
         )
     except ValidationError as error:
-        item = error.errors()[0]
-        location = ".".join(str(part) for part in item["loc"])
-        raise ConfigError(
-            f"invalid configuration at {location}: {item['msg']}"
-        ) from error
+        raise ConfigError(_error_message(error)) from error
+
+
+def _error_message(error: ValidationError) -> str:
+    item = error.errors()[0]
+    location = ".".join(str(part) for part in item["loc"])
+    return f"invalid configuration at {location}: {item['msg']}"
+
+
+def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
+    path = config.config_dir / "machines.yaml"
+    data = _read_yaml(path)
+    machines = data["machines"]
+    if machine_id is None:
+        machine_id = secrets.token_hex(4)
+        while machine_id in config.machines or machine_id in machines:
+            machine_id = secrets.token_hex(4)
+    entry = dict(machines.get(machine_id) or {})
+    for key, value in changes.items():
+        if value is None:
+            entry.pop(key, None)
+        else:
+            entry[key] = value
+    try:
+        machine = MachineConfig.model_validate(entry)
+    except ValidationError as error:
+        raise ConfigError(_error_message(error)) from error
+    machines[machine_id] = entry
+    temporary = path.with_name("machines.yaml.tmp")
+    temporary.write_text(yaml.safe_dump(data, sort_keys=False))
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+    machine.key_path = config.config_dir / machine.key_path if machine.key_path else None
+    config.machines[machine_id] = machine
+    view = machine.model_dump(mode="json", exclude={"password", "sudo_password"})
+    return {"id": machine_id, **view, "key_path": entry.get("key_path")}

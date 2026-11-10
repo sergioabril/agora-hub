@@ -57,3 +57,11 @@ def test_missing_known_hosts_fails(config_dir: Path):
 
     with pytest.raises(ConfigError):
         load_config(config_dir)
+
+
+def test_duplicate_machine_id_fails(config_dir: Path):
+    path = config_dir / "machines.yaml"
+    path.write_text(path.read_text() + "  spark-1:\n    name: Again\n")
+
+    with pytest.raises(ConfigError, match="spark-1"):
+        load_config(config_dir)
