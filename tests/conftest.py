@@ -2,17 +2,17 @@ from pathlib import Path
 from shutil import copy
 
 import pytest
+import yaml
 
 
 @pytest.fixture
-def config_dir(tmp_path: Path, monkeypatch) -> Path:
-    monkeypatch.delenv("AGORA_HUB_ADMIN_TOKEN", raising=False)
-    monkeypatch.delenv("HOME_ASSISTANT_TOKEN", raising=False)
+def config_dir(tmp_path: Path) -> Path:
     examples = Path(__file__).parents[1] / "examples"
-    for name in ("hub.yaml", "machines.yaml", "deployments.yaml"):
+    for name in ("machines.yaml", "deployments.yaml"):
         copy(examples / name, tmp_path / name)
+    hub = yaml.safe_load((examples / "hub.yaml").read_text())
+    hub["api"]["admin_token"] = "a" * 64
+    hub["home_assistant"]["token"] = "test-ha-token"
+    (tmp_path / "hub.yaml").write_text(yaml.safe_dump(hub))
     (tmp_path / "known_hosts").write_text("")
-    (tmp_path / ".env").write_text(
-        "AGORA_HUB_ADMIN_TOKEN=" + "a" * 64 + "\nHOME_ASSISTANT_TOKEN=test-ha-token\n"
-    )
     return tmp_path

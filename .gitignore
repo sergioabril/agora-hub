@@ -3,7 +3,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .DS_Store
-.env
 /hub.yaml
 /machines.yaml
 /deployments.yaml

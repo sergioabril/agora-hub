@@ -48,7 +48,7 @@ class Adapters(Protocol):
 
 
 def redact(text: str, config: Config) -> str:
-    secrets = [config.admin_token, config.ha_token]
+    secrets = [config.hub.api.admin_token, config.hub.home_assistant.token]
     for machine in config.machines.values():
         secrets.extend([machine.password, machine.sudo_password])
     for secret in secrets:
@@ -181,7 +181,7 @@ class RealAdapters:
         machine = self.config.machines[machine_id]
         home_assistant = self.config.hub.home_assistant
         base_url = str(home_assistant.base_url).rstrip("/")
-        headers = {"Authorization": f"Bearer {self.config.ha_token.get_secret_value()}"}
+        headers = {"Authorization": f"Bearer {home_assistant.token.get_secret_value()}"}
         body = {"entity_id": machine.plug_entity_id}
         try:
             async with httpx.AsyncClient(

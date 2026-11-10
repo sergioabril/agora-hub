@@ -31,6 +31,8 @@ def test_valid_config_loads(config_dir: Path):
         ("machines.yaml", lambda data: data["machines"].update({"Bad ID": data["machines"]["spark-1"]})),
         ("machines.yaml", lambda data: data["machines"]["spark-1"].update(device="toaster")),
         ("hub.yaml", lambda data: data["api"].update(unknown=True)),
+        ("hub.yaml", lambda data: data["api"].update(admin_token="bad")),
+        ("hub.yaml", lambda data: data["home_assistant"].update(token="")),
     ],
 )
 def test_invalid_config_fails(config_dir: Path, file_name, change):
@@ -38,15 +40,6 @@ def test_invalid_config_fails(config_dir: Path, file_name, change):
     data = yaml.safe_load(path.read_text())
     change(data)
     path.write_text(yaml.safe_dump(data))
-
-    with pytest.raises(ConfigError):
-        load_config(config_dir)
-
-
-def test_bad_admin_token_fails(config_dir: Path):
-    (config_dir / ".env").write_text(
-        "AGORA_HUB_ADMIN_TOKEN=bad\nHOME_ASSISTANT_TOKEN=test-ha-token\n"
-    )
 
     with pytest.raises(ConfigError):
         load_config(config_dir)

@@ -58,7 +58,7 @@ async def test_invalid_ids_and_actions(api):
 
 async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     config, adapters, controller, app, headers = api
-    secret = config.admin_token.get_secret_value()
+    secret = config.hub.api.admin_token.get_secret_value()
     adapters.reachable["spark-1"] = True
     adapters.failures[("observe", "spark-2")] = AdapterError("connect", f"failed {secret}")
     adapters.failures[("deployment_status", "pro")] = AdapterError("command", f"bad {secret}")

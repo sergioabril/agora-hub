@@ -1,14 +1,14 @@
 api:
   host: 127.0.0.1
   port: 3333
-  admin_token_env: AGORA_HUB_ADMIN_TOKEN
+  admin_token: REPLACE_WITH_64_HEX_CHARACTERS # openssl rand -hex 32
 
 ssh:
   known_hosts_path: known_hosts
 
 home_assistant:
   base_url: http://homeassistant.local:8123
-  token_env: HOME_ASSISTANT_TOKEN
+  token: REPLACE_LOCALLY # Home Assistant long-lived access token
   turn_off_path: /api/services/switch/turn_off
   turn_on_path: /api/services/switch/turn_on
   power_cycle_delay_seconds: 5

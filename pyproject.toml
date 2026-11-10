@@ -6,7 +6,6 @@ dependencies = [
   "asyncssh",
   "fastapi",
   "httpx",
-  "python-dotenv",
   "pyyaml",
   "uvicorn",
 ]

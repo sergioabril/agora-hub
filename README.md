@@ -20,26 +20,35 @@ uv sync
 uv run python -m agora_hub --config-dir "$HOME/.config/agora/agora-hub"
 ```
 
-Docker:
+Docker (the only supported way to run the image locally):
 
 ```sh
-make build
-docker run --rm --name agora-hub \
-  --publish 3333:3333 \
-  --mount type=bind,src="$HOME/.config/agora/agora-hub",dst=/config \
-  agora-hub:local
+make deploy
 ```
+
+`make deploy` creates `~/.config/agora/agora-hub/` (and any missing parent folder) and adds only the files that are missing; it never overwrites existing ones:
+
+- `hub.yaml`: a copy of `examples/hub.yaml` with a freshly generated `api.admin_token`, no scheduled machines and no startup deployment
+- `machines.yaml`: `machines: {}`
+- `deployments.yaml`: `deployments: {}`
+- `known_hosts`: empty
+
+It then builds the image and starts the hub in the background on port `3333`, with the config folder mounted writable so the add and update endpoints can save machines. The container uses `--restart unless-stopped`, so it comes back after a crash, a Docker restart or a reboot (on macOS, enable Docker Desktop's "Start when you sign in"). Run `make deploy` again to rebuild and replace it; nothing in the config folder is overwritten. Use `make deploy CONFIG_DIR=/other/path` for a different folder.
+
+After the first deploy, replace `home_assistant.token` in `hub.yaml` with your Home Assistant token, add host keys with `ssh-keyscan -H <host> >> ~/.config/agora/agora-hub/known_hosts`, and add machines through `POST /admin/machines/add`. `known_hosts` is read on every SSH connection; after editing a YAML file by hand, run `docker restart agora-hub`.
+
+Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
 
 ## 3. Config files
 
-`hub.yaml`:
+`hub.yaml` (secrets live in the YAML files, like the machine passwords: `api.admin_token` is 64 hex characters from `openssl rand -hex 32`, `home_assistant.token` is a Home Assistant long-lived access token):
 
 ```yaml
-api: {host: 127.0.0.1, port: 3333, admin_token_env: AGORA_HUB_ADMIN_TOKEN}
+api: {host: 127.0.0.1, port: 3333, admin_token: "64_HEX_CHARACTERS"}
 ssh: {known_hosts_path: known_hosts}
 home_assistant:
   base_url: http://homeassistant.local:8123
-  token_env: HOME_ASSISTANT_TOKEN
+  token: REPLACE_LOCALLY
   turn_off_path: /api/services/switch/turn_off
   turn_on_path: /api/services/switch/turn_on
   power_cycle_delay_seconds: 5
@@ -91,23 +100,14 @@ deployments:
     readiness: {path: /v1/models, expected_status: 200}
 ```
 
-`.env`:
-
-```dotenv
-AGORA_HUB_ADMIN_TOKEN=64_HEX_CHARACTERS
-HOME_ASSISTANT_TOKEN=REPLACE_LOCALLY
-```
-
-Set up the owner-only configuration directory and required `known_hosts` file:
+For a native run, set up the owner-only configuration directory and required `known_hosts` file by hand (`make deploy` does this for Docker), then set `api.admin_token` and `home_assistant.token` in `hub.yaml`:
 
 ```sh
 CONFIG_DIR="$HOME/.config/agora/agora-hub"
 mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
 cp examples/{hub,machines,deployments}.yaml "$CONFIG_DIR/"
-TOKEN=$(openssl rand -hex 32)
-printf 'AGORA_HUB_ADMIN_TOKEN=%s\nHOME_ASSISTANT_TOKEN=%s\n' "$TOKEN" 'REPLACE_LOCALLY' > "$CONFIG_DIR/.env"
 ssh-keyscan -H <host> >> "$CONFIG_DIR/known_hosts"
-chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,.env,known_hosts}
+chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 ```
 
 `known_hosts` and relative SSH key paths are resolved from the configuration directory.

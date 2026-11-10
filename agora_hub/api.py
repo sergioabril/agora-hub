@@ -22,7 +22,7 @@ class DeploymentAction(BaseModel):
 
 def create_app(config: Config, controller: Controller) -> FastAPI:
     async def authenticate(authorization: Annotated[str | None, Header()] = None):
-        expected = "Bearer " + config.admin_token.get_secret_value()
+        expected = "Bearer " + config.hub.api.admin_token.get_secret_value()
         if authorization is None or not secrets.compare_digest(authorization, expected):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unauthorized")
 

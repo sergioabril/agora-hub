@@ -6,7 +6,6 @@ from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, PositiveFloat, SecretStr
 from pydantic import ValidationError, constr, field_validator, model_validator
 
@@ -27,7 +26,14 @@ class Model(BaseModel):
 class APIConfig(Model):
     host: str
     port: int = 3333
-    admin_token_env: str
+    admin_token: SecretStr = Field(repr=False)
+
+    @field_validator("admin_token")
+    @classmethod
+    def hex_token(cls, value: SecretStr) -> SecretStr:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value.get_secret_value()):
+            raise ValueError("must contain 64 hex characters")
+        return value
 
 
 class SSHConfig(Model):
@@ -36,7 +42,7 @@ class SSHConfig(Model):
 
 class HomeAssistantConfig(Model):
     base_url: HttpUrl
-    token_env: str
+    token: SecretStr = Field(min_length=1, repr=False)
     turn_off_path: str
     turn_on_path: str
     power_cycle_delay_seconds: float = Field(ge=0)
@@ -126,8 +132,6 @@ class Config(Model):
     machines: dict[ConfigId, MachineConfig]
     deployments: dict[ConfigId, DeploymentConfig]
     config_dir: Path
-    admin_token: SecretStr = Field(repr=False)
-    ha_token: SecretStr = Field(repr=False)
 
     @model_validator(mode="after")
     def validate_config(self):
@@ -179,19 +183,8 @@ def load_config(config_dir: Path) -> Config:
     hub_yaml = _read_yaml(config_dir / "hub.yaml")
     machines_yaml = _read_yaml(config_dir / "machines.yaml")
     deployments_yaml = _read_yaml(config_dir / "deployments.yaml")
-    env = dotenv_values(config_dir / ".env") | os.environ
     try:
-        hub = HubConfig.model_validate(hub_yaml)
-        admin_token = env.get(hub.api.admin_token_env) or ""
-        ha_token = env.get(hub.home_assistant.token_env) or ""
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", admin_token):
-            raise ConfigError(f"{hub.api.admin_token_env} must contain 64 hex characters")
-        if not ha_token:
-            raise ConfigError(f"{hub.home_assistant.token_env} must be set")
-        return Config(
-            hub=hub, config_dir=config_dir, admin_token=admin_token, ha_token=ha_token,
-            **machines_yaml, **deployments_yaml,
-        )
+        return Config(hub=hub_yaml, config_dir=config_dir, **machines_yaml, **deployments_yaml)
     except ValidationError as error:
         raise ConfigError(_error_message(error)) from error
 
