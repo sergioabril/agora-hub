@@ -175,6 +175,7 @@ async def test_status_script_timeout(config, monkeypatch):
     [
         (asyncssh.PermissionDenied("bad password"), "auth"),
         (OSError("no route"), "connect"),
+        (TimeoutError(), "connect"),
         (asyncssh.HostKeyNotVerifiable("untrusted"), "host_key"),
     ],
 )
@@ -183,6 +184,23 @@ async def test_ssh_error_kinds(config, monkeypatch, error, kind):
     with pytest.raises(AdapterError) as caught:
         await make_adapters(config).observe("spark-1")
     assert caught.value.kind == kind
+    assert str(caught.value)
+
+
+async def test_ssh_connect_timeout_says_so(config, monkeypatch):
+    install_ssh(monkeypatch, error=TimeoutError())
+    with pytest.raises(AdapterError) as caught:
+        await make_adapters(config).observe("spark-1")
+    assert str(caught.value) == "timed out after 10s"
+
+
+async def test_readiness_timeout_has_a_message(config):
+    def handler(request):
+        raise httpx.ConnectTimeout("", request=request)
+
+    with pytest.raises(AdapterError) as caught:
+        await make_adapters(config, httpx.MockTransport(handler)).ready("pro")
+    assert str(caught.value) == "ConnectTimeout"
 
 
 async def test_shutdown_sends_sudo_password_only_on_stdin(config, monkeypatch):

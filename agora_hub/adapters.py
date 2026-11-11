@@ -67,7 +67,9 @@ class RealAdapters:
         self.transport = transport
 
     def _error(self, kind: str, error: object) -> AdapterError:
-        return AdapterError(kind, redact(str(error), self.config))
+        # Timeouts often stringify to "" (e.g. httpx.ConnectTimeout); fall back to the class name.
+        message = str(error) or type(error).__name__
+        return AdapterError(kind, redact(message, self.config))
 
     # Trust on first use, like `ssh -o StrictHostKeyChecking=accept-new`: an unknown host's key
     # is saved; a host that is already listed must keep presenting a listed key.
@@ -102,6 +104,9 @@ class RealAdapters:
             raise self._error("auth", error) from error
         except asyncssh.HostKeyNotVerifiable as error:
             raise self._error("host_key", error) from error
+        except TimeoutError as error:  # an OSError, but its message is empty
+            timeout = self.config.hub.timeouts.ssh_connect_seconds
+            raise self._error("connect", f"timed out after {timeout:g}s") from error
         except (OSError, asyncssh.DisconnectError) as error:
             raise self._error("connect", error) from error
 
