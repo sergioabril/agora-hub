@@ -36,6 +36,9 @@ class FakeAdapters:
             hook()
         return self.run_results.get((machine_id, command), CommandResult(0, "", ""))
 
+    async def login(self, machine) -> None:
+        await self._call("login", machine.host)
+
     async def wake(self, machine_id: str) -> None:
         await self._call("wake", machine_id)
         self.reachable[machine_id] = True

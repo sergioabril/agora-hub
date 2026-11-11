@@ -44,8 +44,35 @@ def install_ssh(monkeypatch, connection=None, error=None):
             raise error
         return connection
 
+    async def get_server_host_key(host, port):
+        return HOST_KEY
+
     monkeypatch.setattr(asyncssh, "connect", connect)
+    monkeypatch.setattr(asyncssh, "get_server_host_key", get_server_host_key)
     return calls
+
+
+HOST_KEY = asyncssh.generate_private_key("ssh-ed25519")
+
+
+async def test_unknown_host_key_is_saved_once_and_known_hosts_are_not_rescanned(config, monkeypatch):
+    install_ssh(monkeypatch, FakeConnection())
+    scans = []
+
+    async def get_server_host_key(host, port):
+        scans.append((host, port))
+        return HOST_KEY
+
+    monkeypatch.setattr(asyncssh, "get_server_host_key", get_server_host_key)
+    known_hosts = config.hub.ssh.known_hosts_path
+    other = asyncssh.generate_private_key("ssh-ed25519").export_public_key().decode()
+    known_hosts.write_text(f"spark-2.local {other}")
+    adapters = make_adapters(config)
+    await adapters.observe("spark-1")
+    await adapters.observe("spark-1")
+    await adapters.observe("spark-2")
+    assert scans == [("spark-1.local", 22)]
+    assert known_hosts.read_text() == f"spark-2.local {other}spark-1.local {HOST_KEY.export_public_key().decode()}"
 
 
 async def test_wake_posts_off_then_on_with_auth_body_and_delay(config, monkeypatch):

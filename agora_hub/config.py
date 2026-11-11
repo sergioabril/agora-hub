@@ -143,8 +143,8 @@ class Config(Model):
         for machine in self.machines.values():
             machine.key_path = self.config_dir / machine.key_path if machine.key_path else None
         machine_ids = set(self.machines)
-        if "add" in machine_ids:
-            raise ValueError("machine id add is reserved")
+        if reserved := {"add", "test"} & machine_ids:
+            raise ValueError(f"machine id {sorted(reserved)[0]} is reserved")
         schedule = self.hub.schedule
         if unknown := set(schedule.machines) - machine_ids:
             raise ValueError(f"unknown schedule machine: {sorted(unknown)[0]}")
@@ -197,6 +197,15 @@ def _error_message(error: ValidationError) -> str:
     return f"invalid configuration at {location}: {item['msg']}"
 
 
+def parse_machine(config: Config, entry: dict) -> MachineConfig:
+    try:
+        machine = MachineConfig.model_validate(entry)
+    except ValidationError as error:
+        raise ConfigError(_error_message(error)) from error
+    machine.key_path = config.config_dir / machine.key_path if machine.key_path else None
+    return machine
+
+
 def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
     path = config.config_dir / "machines.yaml"
     data = _read_yaml(path)
@@ -211,16 +220,12 @@ def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
             entry.pop(key, None)
         else:
             entry[key] = value
-    try:
-        machine = MachineConfig.model_validate(entry)
-    except ValidationError as error:
-        raise ConfigError(_error_message(error)) from error
+    machine = parse_machine(config, entry)
     machines[machine_id] = entry
     temporary = path.with_name("machines.yaml.tmp")
     temporary.write_text(yaml.safe_dump(data, sort_keys=False))
     temporary.chmod(0o600)
     os.replace(temporary, path)
-    machine.key_path = config.config_dir / machine.key_path if machine.key_path else None
     config.machines[machine_id] = machine
     view = machine.model_dump(mode="json", exclude={"password", "sudo_password"})
     return {"id": machine_id, **view, "key_path": entry.get("key_path")}

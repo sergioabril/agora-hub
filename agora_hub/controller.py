@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
 from .adapters import AdapterError, Adapters, redact
-from .config import Config
+from .config import Config, MachineConfig
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +83,13 @@ class Controller:
             return False
         finally:
             operation.finished_at = _now()
+
+    async def test_login(self, machine: MachineConfig) -> dict:
+        try:
+            await self.adapters.login(machine)
+        except AdapterError as caught:
+            return {"reachable": caught.kind in ("auth", "host_key"), "error": self._error(caught)}
+        return {"reachable": True, "error": None}
 
     async def _observe_machine(self, machine_id: str) -> dict:
         reachable = False

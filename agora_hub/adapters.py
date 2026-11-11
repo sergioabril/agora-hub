@@ -6,7 +6,7 @@ from typing import Protocol
 import asyncssh
 import httpx
 
-from .config import Config
+from .config import Config, MachineConfig
 
 
 @dataclass
@@ -27,6 +27,8 @@ STATES = ("stopped", "starting", "running", "stopping", "failed", "unknown")
 
 class Adapters(Protocol):
     async def observe(self, machine_id: str) -> None: ...
+
+    async def login(self, machine: MachineConfig) -> None: ...
 
     async def run(
         self,
@@ -67,14 +69,27 @@ class RealAdapters:
     def _error(self, kind: str, error: object) -> AdapterError:
         return AdapterError(kind, redact(str(error), self.config))
 
-    async def _connect(self, machine_id: str):
-        machine = self.config.machines[machine_id]
+    # Trust on first use, like `ssh -o StrictHostKeyChecking=accept-new`: an unknown host's key
+    # is saved; a host that is already listed must keep presenting a listed key.
+    async def _trust_new_host(self, host: str, port: int) -> None:
+        path = self.config.hub.ssh.known_hosts_path
+        if any(asyncssh.match_known_hosts(str(path), host, "", None if port == 22 else port)[:2]):
+            return
+        timeout = self.config.hub.timeouts.ssh_connect_seconds
+        key = await asyncio.wait_for(asyncssh.get_server_host_key(host, port), timeout)
+        if key:
+            entry = host if port == 22 else f"[{host}]:{port}"
+            with path.open("a") as file:
+                file.write(f"{entry} {key.export_public_key().decode()}")
+
+    async def _connect(self, machine: MachineConfig):
         authentication = (
             {"password": machine.password.get_secret_value()}
             if machine.password
             else {"client_keys": [machine.key_path]}
         )
         try:
+            await self._trust_new_host(machine.host, machine.port)
             return await asyncssh.connect(
                 machine.host,
                 port=machine.port,
@@ -90,10 +105,13 @@ class RealAdapters:
         except (OSError, asyncssh.DisconnectError) as error:
             raise self._error("connect", error) from error
 
-    async def observe(self, machine_id: str) -> None:
-        connection = await self._connect(machine_id)
+    async def login(self, machine: MachineConfig) -> None:
+        connection = await self._connect(machine)
         connection.close()
         await connection.wait_closed()
+
+    async def observe(self, machine_id: str) -> None:
+        await self.login(self.config.machines[machine_id])
 
     async def run(
         self,
@@ -104,7 +122,7 @@ class RealAdapters:
         timeout: float,
         stdin: str | None = None,
     ) -> CommandResult:
-        connection = await self._connect(machine_id)
+        connection = await self._connect(self.config.machines[machine_id])
         remote_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
         try:
             result = await connection.run(

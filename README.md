@@ -37,7 +37,9 @@ It then builds the image and starts the hub in the background on port `3333`, wi
 
 > **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`).
 
-After the first deploy, replace `home_assistant.token` in `hub.yaml` with your Home Assistant token, add host keys with `ssh-keyscan -H <host> >> ~/.config/agora/agora-hub/known_hosts`, and add machines through `POST /admin/machines/add`. `known_hosts` is read on every SSH connection; after editing a YAML file by hand, run `docker restart agora-hub`.
+After the first deploy, replace `home_assistant.token` in `hub.yaml` with your Home Assistant token and add machines through `POST /admin/machines/add`. After editing a YAML file by hand, run `docker restart agora-hub`.
+
+SSH host keys are trusted on first use, like `ssh -o StrictHostKeyChecking=accept-new`: the first time the hub connects to a host that isn't in `known_hosts`, it saves that host's key there. From then on, the host must keep presenting a saved key, or the hub refuses to connect and reports a `host_key` error, so a machine impersonating it can't collect the SSH or sudo password. After a legitimate key change (a reinstall), remove the old entry with `ssh-keygen -R <host> -f ~/.config/agora/agora-hub/known_hosts`; the next connection saves the new key. `known_hosts` is read on every SSH connection, so no restart is needed.
 
 Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
 
@@ -72,7 +74,7 @@ timeouts:
   readiness_poll_seconds: 5
 ```
 
-`machines.yaml` (each key is the machine id: ids must be unique, the hub generates them for machines added through the API, and `add` is reserved; `name` is required and is the label people see; defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
+`machines.yaml` (each key is the machine id: ids must be unique, the hub generates them for machines added through the API, and `add` and `test` are reserved; `name` is required and is the label people see; defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
 
 ```yaml
 machines:
@@ -108,7 +110,7 @@ For a native run, set up the owner-only configuration directory and required `kn
 CONFIG_DIR="$HOME/.config/agora/agora-hub"
 mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
 cp examples/{hub,machines,deployments}.yaml "$CONFIG_DIR/"
-ssh-keyscan -H <host> >> "$CONFIG_DIR/known_hosts"
+touch "$CONFIG_DIR/known_hosts"
 chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 ```
 
@@ -122,6 +124,7 @@ When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <a
 | --- | --- | --- |
 | `GET /admin/machines/status` | None | Refreshes machine observations (with each machine's `name`, `host` and `device`) without mutations. |
 | `POST /admin/machines/add` | Machine fields (`name`, `host`, `user`, ...) | Adds a machine with a hub-generated 8-hex id; returns `201` with the machine (no passwords), or `422`. |
+| `POST /admin/machines/test` | Machine fields, as for add | Validates them like add, then tries an SSH login without saving the machine; returns `200` with `{"reachable", "error"}` (`error` is `null` when the login works, otherwise `auth: ...`, `host_key: ...` or `connect: ...`), or `422`. Like any first connection, it saves a new host's key to `known_hosts`. |
 | `POST /admin/machines/{machine_id}/update` | Any subset of machine fields; `null` resets one to its default | Updates a machine; returns `200`, `404`, `409` (`machine_busy`), or `422`. |
 | `POST /admin/machines/{machine_id}` | `{"action":"on"}` or `{"action":"off"}` | Starts an independent machine action; returns `202`, or `409` when blocked. |
 | `GET /admin/deployments/status` | None | Refreshes deployment state, readiness, endpoint, member `machines`, `head`, and operation status without mutations. |
@@ -135,6 +138,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Spark 5","host":"spark-5.local","user":"agora","password":"...","plug_entity_id":"switch.spark_5"}' \
   http://localhost:3333/admin/machines/add
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Spark 5","host":"spark-5.local","user":"agora","password":"...","plug_entity_id":"switch.spark_5"}' \
+  http://localhost:3333/admin/machines/test
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"host":"10.0.0.5"}' http://localhost:3333/admin/machines/spark-1/update
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/status

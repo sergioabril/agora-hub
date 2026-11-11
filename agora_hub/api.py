@@ -7,7 +7,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from .config import Config, ConfigError, save_machine
+from .config import Config, ConfigError, parse_machine, save_machine
 from .controller import Conflict, Controller
 from .schedule import run_schedule
 
@@ -70,6 +70,14 @@ def create_app(config: Config, controller: Controller) -> FastAPI:
     @app.post("/admin/machines/add", status_code=201)
     async def add_machine(body: dict):
         return save(None, body)
+
+    @app.post("/admin/machines/test")
+    async def test_machine(body: dict):
+        try:
+            machine = parse_machine(config, body)
+        except ConfigError as error:
+            raise HTTPException(422, str(error)) from error
+        return await controller.test_login(machine)
 
     @app.post("/admin/machines/{machine_id}/update")
     async def update_machine(machine_id: str, body: dict):

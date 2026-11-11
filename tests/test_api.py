@@ -32,7 +32,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_six_routes(api):
+async def test_auth_precedes_validation_and_only_seven_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
@@ -42,7 +42,7 @@ async def test_auth_precedes_validation_and_only_six_routes(api):
     assert missing.status_code == wrong.status_code == 401
     assert right.status_code == 200
     assert all(response.status_code == 404 for response in hidden)
-    assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 6
+    assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 7
 
 
 async def test_empty_admin_token_disables_auth(config_dir):
@@ -192,6 +192,23 @@ async def test_add_machine_writes_file_and_status(api):
     assert status.json()["machines"][machine_id]["name"] == "Studio"
     assert with_id.status_code == nameless.status_code == 422
     assert "hunter2-secret" not in with_id.text + nameless.text
+    await controller.close()
+
+
+async def test_machine_login_test_saves_nothing(api):
+    config, adapters, controller, app, headers = api
+    before = (config.config_dir / "machines.yaml").read_text()
+    adapters.failures[("login", "bad.local")] = AdapterError("auth", "Permission denied")
+    async with client(app) as request:
+        ok = await request.post("/admin/machines/test", json=NEW_MACHINE, headers=headers)
+        denied = await request.post("/admin/machines/test", json={**NEW_MACHINE, "host": "bad.local"}, headers=headers)
+        no_auth = {key: value for key, value in NEW_MACHINE.items() if key != "password"}
+        invalid = await request.post("/admin/machines/test", json=no_auth, headers=headers)
+    assert ok.json() == {"reachable": True, "error": None}
+    assert denied.json() == {"reachable": True, "error": "auth: Permission denied"}
+    assert invalid.status_code == 422 and "password or key_path is required" in invalid.json()["detail"]
+    assert ("login", "studio.local") in adapters.calls
+    assert (config.config_dir / "machines.yaml").read_text() == before and "test" not in config.machines
     await controller.close()
 
 
