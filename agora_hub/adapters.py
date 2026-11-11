@@ -7,6 +7,7 @@ import asyncssh
 import httpx
 
 from .config import Config, MachineConfig
+from .home_assistant import HomeAssistant, HomeAssistantError
 
 
 @dataclass
@@ -65,6 +66,7 @@ class RealAdapters:
     def __init__(self, config: Config, transport: httpx.AsyncBaseTransport | None = None):
         self.config = config
         self.transport = transport
+        self.home_assistant = HomeAssistant(config, transport)
 
     def _error(self, kind: str, error: object) -> AdapterError:
         # Timeouts often stringify to "" (e.g. httpx.ConnectTimeout); fall back to the class name.
@@ -201,25 +203,10 @@ class RealAdapters:
             raise AdapterError("http", f"readiness returned HTTP {response.status_code}")
 
     async def wake(self, machine_id: str) -> None:
-        machine = self.config.machines[machine_id]
-        home_assistant = self.config.hub.home_assistant
-        base_url = str(home_assistant.base_url).rstrip("/")
-        headers = {"Authorization": f"Bearer {home_assistant.token.get_secret_value()}"}
-        body = {"entity_id": machine.plug_entity_id}
         try:
-            async with httpx.AsyncClient(
-                transport=self.transport,
-                headers=headers,
-                timeout=self.config.hub.timeouts.http_seconds,
-            ) as client:
-                paths = (home_assistant.turn_off_path, home_assistant.turn_on_path)
-                for index, path in enumerate(paths):
-                    response = await client.post(base_url + path, json=body)
-                    response.raise_for_status()
-                    if index == 0:
-                        await asyncio.sleep(home_assistant.power_cycle_delay_seconds)
-        except httpx.HTTPError as error:
-            raise self._error("http", error) from error
+            await self.home_assistant.power_cycle(self.config.machines[machine_id].plug_entity_id)
+        except HomeAssistantError as error:
+            raise AdapterError(error.kind, str(error)) from error
 
 
 def make_adapters(

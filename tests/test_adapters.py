@@ -81,7 +81,7 @@ async def test_wake_posts_off_then_on_with_auth_body_and_delay(config, monkeypat
 
     def handler(request):
         requests.append(request)
-        return httpx.Response(200)
+        return httpx.Response(200, json=[])
 
     async def sleep(seconds):
         delays.append(seconds)
@@ -95,9 +95,10 @@ async def test_wake_posts_off_then_on_with_auth_body_and_delay(config, monkeypat
         "/api/services/switch/turn_on",
     ]
     assert [json.loads(request.content) for request in requests] == [
-        {"entity_id": "switch.spark_1"},
-        {"entity_id": "switch.spark_1"},
+        {"entity_id": ["switch.spark_1"]},
+        {"entity_id": ["switch.spark_1"]},
     ]
+    assert all(request.url.netloc == b"homeassistant.local:8123" for request in requests)
     assert all(r.headers["Authorization"] == "Bearer test-ha-token" for r in requests)
     assert delays == [5]
 

@@ -37,7 +37,11 @@ It then builds the image and starts the hub in the background on port `3333`, wi
 
 > **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`).
 
-After the first deploy, replace `home_assistant.token` in `hub.yaml` with your Home Assistant token and add machines through `POST /admin/machines/add`. After editing a YAML file by hand, run `docker restart agora-hub`.
+After the first deploy, set Home Assistant's `host`, `port` and long-lived access `token` through `POST /admin/integrations/homeassistant`, then add machines through `POST /admin/machines/add` (see §4). After editing a YAML file by hand, run `docker restart agora-hub`.
+
+```sh
+curl -X POST -H 'Content-Type: application/json' -d '{"host":"192.168.1.10","port":8123,"token":"..."}' http://localhost:3333/admin/integrations/homeassistant
+```
 
 SSH host keys are trusted on first use, like `ssh -o StrictHostKeyChecking=accept-new`: the first time the hub connects to a host that isn't in `known_hosts`, it saves that host's key there. From then on, the host must keep presenting a saved key, or the hub refuses to connect and reports a `host_key` error, so a machine impersonating it can't collect the SSH or sudo password. After a legitimate key change (a reinstall), remove the old entry with `ssh-keygen -R <host> -f ~/.config/agora/agora-hub/known_hosts`; the next connection saves the new key. `known_hosts` is read on every SSH connection, so no restart is needed.
 
@@ -51,10 +55,9 @@ Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
 api: {host: 127.0.0.1, port: 3333, admin_token: ""}
 ssh: {known_hosts_path: known_hosts}
 home_assistant:
-  base_url: http://homeassistant.local:8123
-  token: REPLACE_LOCALLY
-  turn_off_path: /api/services/switch/turn_off
-  turn_on_path: /api/services/switch/turn_on
+  host: homeassistant.local
+  port: 8123
+  token: ""
   power_cycle_delay_seconds: 5
 schedule:
   enabled: true
@@ -73,6 +76,8 @@ timeouts:
   deployment_stop_seconds: 60
   readiness_poll_seconds: 5
 ```
+
+The hub calls Home Assistant at plain `http://<host>:<port>` (`host` is an IP or hostname, without scheme). An empty `token` means Home Assistant is not configured: the switch endpoints answer `409` and waking a machine fails.
 
 `machines.yaml` (each key is the machine id: ids must be unique, the hub generates them for machines added through the API, and `add` and `test` are reserved; `name` is required and is the label people see; defaults: port `22`, `key_path: null`, `shutdown_command: "sudo -S -p '' poweroff"`, and `device: dgx-spark`; configure either `password` or `key_path`; `device` is one of `dgx-spark`, `rtx6000`, `mac-studio` and only affects how agora-dashboard draws the machine):
 
@@ -104,7 +109,7 @@ deployments:
     readiness: {path: /v1/models, expected_status: 200}
 ```
 
-For a native run, set up the owner-only configuration directory and required `known_hosts` file by hand (`make deploy` does this for Docker), then set `home_assistant.token` (and, to enforce authentication, `api.admin_token`) in `hub.yaml`:
+For a native run, set up the owner-only configuration directory and required `known_hosts` file by hand (`make deploy` does this for Docker), then set `api.admin_token` in `hub.yaml` to enforce authentication, and set up Home Assistant through `POST /admin/integrations/homeassistant` once the hub runs:
 
 ```sh
 CONFIG_DIR="$HOME/.config/agora/agora-hub"
@@ -118,7 +123,7 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 
 ## 4. Endpoint calls
 
-When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <admin-token>` and answers `401` otherwise; when it is empty, no endpoint checks authentication. Add and update apply immediately (no restart) and rewrite `machines.yaml`, which drops its YAML comments.
+When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <admin-token>` and answers `401` otherwise; when it is empty, no endpoint checks authentication. Add and update apply immediately (no restart) and rewrite `machines.yaml`, which drops its YAML comments; saving the Home Assistant settings likewise rewrites `hub.yaml` and drops its comments.
 
 | Method and path | Body | What it does |
 | --- | --- | --- |
@@ -129,6 +134,10 @@ When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <a
 | `POST /admin/machines/{machine_id}` | `{"action":"on"}` or `{"action":"off"}` | Starts an independent machine action; returns `202`, or `409` when blocked. |
 | `GET /admin/deployments/status` | None | Refreshes deployment state, readiness, endpoint, member `machines`, `head`, and operation status without mutations. |
 | `POST /admin/deployments/{deployment_id}` | `{"action":"start"}` or `{"action":"stop"}` | Starts an independent deployment action; returns `202`, or `409` when blocked. |
+| `GET /admin/integrations/homeassistant` | None | Returns `{"host", "port", "token_set", "power_cycle_delay_seconds"}` (never the token) without contacting Home Assistant. |
+| `POST /admin/integrations/homeassistant` | Any subset of `host`, `port`, `token`, `power_cycle_delay_seconds`; `null` resets one to its default, and a `null` or `""` token unsets it | Saves the settings without contacting Home Assistant; returns `200` with the settings view, `422`, or `500`. |
+| `GET /admin/integrations/homeassistant/switches` | None | Returns `200 {"switches": [{"entity_id", "name", "state", "machines"}]}` (every `switch.*` entity, its Home Assistant state, and the ids of machines whose `plug_entity_id` it is), `409` (`home_assistant_not_configured`), or `502` when Home Assistant fails. |
+| `POST /admin/integrations/homeassistant/switches` | `[{"entity_id":"switch.x","state":"on"\|"off"}, ...]` | Turns the switches off, then on, and returns the fresh switch list like GET; `409`, `502`, or `422`. **No guard**: it ignores running operations and machine state, so turning off a machine's plug cuts its power without shutting it down. |
 
 ```sh
 TOKEN=your-64-character-token
@@ -146,4 +155,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/status
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"start"}' http://localhost:3333/admin/deployments/pro
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/integrations/homeassistant/switches
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '[{"entity_id":"switch.lamp","state":"on"}]' http://localhost:3333/admin/integrations/homeassistant/switches
 ```

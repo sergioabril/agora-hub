@@ -25,9 +25,10 @@ def main() -> None:
         print(error, file=sys.stderr)
         raise SystemExit(2) from error
 
-    controller = Controller(config, make_adapters(config))
+    adapters = make_adapters(config)
+    controller = Controller(config, adapters)
     uvicorn.run(
-        create_app(config, controller),
+        create_app(config, controller, adapters.home_assistant),
         host=args.host if args.host is not None else config.hub.api.host,
         port=args.port if args.port is not None else config.hub.api.port,
         workers=1,

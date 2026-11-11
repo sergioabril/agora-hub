@@ -32,7 +32,7 @@ def test_valid_config_loads(config_dir: Path):
         ("machines.yaml", lambda data: data["machines"]["spark-1"].update(device="toaster")),
         ("hub.yaml", lambda data: data["api"].update(unknown=True)),
         ("hub.yaml", lambda data: data["api"].update(admin_token="bad")),
-        ("hub.yaml", lambda data: data["home_assistant"].update(token="")),
+        ("hub.yaml", lambda data: data["home_assistant"].update(host="http://homeassistant.local")),
     ],
 )
 def test_invalid_config_fails(config_dir: Path, file_name, change):

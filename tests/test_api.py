@@ -9,6 +9,7 @@ from agora_hub.adapters import AdapterError
 from agora_hub.api import create_app
 from agora_hub.config import load_config
 from agora_hub.controller import Controller
+from agora_hub.home_assistant import HomeAssistant
 from tests.fakes import FakeAdapters
 
 
@@ -23,7 +24,7 @@ def api(config_dir):
     adapters = FakeAdapters()
     adapters.states["pro"] = "stopped"
     controller = Controller(config, adapters)
-    app = create_app(config, controller)
+    app = create_app(config, controller, HomeAssistant(config))
     headers = {"Authorization": "Bearer " + "a" * 64}
     return config, adapters, controller, app, headers
 
@@ -32,17 +33,20 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_seven_routes(api):
+async def test_auth_precedes_validation_and_only_eleven_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
         wrong = await request.get("/admin/machines/status", headers={"Authorization": "Bearer wrong"})
         right = await request.get("/admin/machines/status", headers=headers)
+        integration = await request.get("/admin/integrations/homeassistant")
         hidden = [await request.get(path, headers=headers) for path in ("/docs", "/redoc", "/openapi.json")]
-    assert missing.status_code == wrong.status_code == 401
+    assert missing.status_code == wrong.status_code == integration.status_code == 401
     assert right.status_code == 200
     assert all(response.status_code == 404 for response in hidden)
-    assert len([route for route in app.routes if getattr(route, "path", "").startswith("/admin")]) == 7
+    included = [route for item in app.routes if hasattr(item, "original_router") for route in item.original_router.routes]
+    paths = [getattr(route, "path", "") for route in [*app.routes, *included]]
+    assert len([path for path in paths if path.startswith("/admin")]) == 11
 
 
 async def test_empty_admin_token_disables_auth(config_dir):
@@ -51,7 +55,7 @@ async def test_empty_admin_token_disables_auth(config_dir):
     hub["api"]["admin_token"] = ""
     path.write_text(yaml.safe_dump(hub))
     config = load_config(config_dir)
-    app = create_app(config, Controller(config, FakeAdapters()))
+    app = create_app(config, Controller(config, FakeAdapters()), HomeAssistant(config))
     async with client(app) as request:
         none = await request.get("/admin/deployments/status")
         anything = await request.get("/admin/deployments/status", headers={"Authorization": "Bearer whatever"})
@@ -165,7 +169,7 @@ async def test_new_controller_has_no_operation_memory(api):
     await controller.task
     fresh_adapters = FakeAdapters()
     fresh = Controller(config, fresh_adapters)
-    fresh_app = create_app(config, fresh)
+    fresh_app = create_app(config, fresh, HomeAssistant(config))
     async with client(fresh_app) as request:
         status = await request.get("/admin/machines/status", headers=headers)
     assert all(machine["operation"] is None for machine in status.json()["machines"].values())

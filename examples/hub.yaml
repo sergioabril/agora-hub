@@ -7,10 +7,9 @@ ssh:
   known_hosts_path: known_hosts
 
 home_assistant:
-  base_url: http://homeassistant.local:8123
-  token: REPLACE_LOCALLY # Home Assistant long-lived access token
-  turn_off_path: /api/services/switch/turn_off
-  turn_on_path: /api/services/switch/turn_on
+  host: homeassistant.local # IP or hostname, no scheme; the hub calls http://<host>:<port>
+  port: 8123
+  token: "" # long-lived access token; empty = not configured (set it with POST /admin/integrations/homeassistant)
   power_cycle_delay_seconds: 5
 
 schedule:

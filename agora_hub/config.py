@@ -13,6 +13,7 @@ ConfigId = constr(pattern=r"^[a-z0-9][a-z0-9_-]*$")
 HubTime = constr(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 ReadinessPath = constr(pattern=r"^/")
 MachineName = constr(strip_whitespace=True, min_length=1)
+HostName = constr(pattern=r"^[A-Za-z0-9.-]+$")  # IP or hostname, no scheme/port/path
 
 
 class ConfigError(Exception):
@@ -43,11 +44,15 @@ class SSHConfig(Model):
 
 
 class HomeAssistantConfig(Model):
-    base_url: HttpUrl
-    token: SecretStr = Field(min_length=1, repr=False)
-    turn_off_path: str
-    turn_on_path: str
+    host: HostName
+    port: int = Field(default=8123, ge=1, le=65535)
+    token: SecretStr | None = Field(default=None, repr=False)
     power_cycle_delay_seconds: float = Field(ge=0)
+
+    @field_validator("token")
+    @classmethod
+    def empty_token(cls, value: SecretStr | None) -> SecretStr | None:
+        return value if value is not None and value.get_secret_value() else None
 
 
 class ScheduleConfig(Model):
@@ -206,6 +211,18 @@ def parse_machine(config: Config, entry: dict) -> MachineConfig:
     return machine
 
 
+def _merge(entry: dict, changes: dict) -> dict:
+    merged = {**entry, **changes}
+    return {key: value for key, value in merged.items() if key not in changes or value is not None}
+
+
+def _write_yaml(path: Path, data: dict) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(yaml.safe_dump(data, sort_keys=False))
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
 def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
     path = config.config_dir / "machines.yaml"
     data = _read_yaml(path)
@@ -214,18 +231,23 @@ def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
         machine_id = secrets.token_hex(4)
         while machine_id in config.machines or machine_id in machines:
             machine_id = secrets.token_hex(4)
-    entry = dict(machines.get(machine_id) or {})
-    for key, value in changes.items():
-        if value is None:
-            entry.pop(key, None)
-        else:
-            entry[key] = value
+    entry = _merge(machines.get(machine_id) or {}, changes)
     machine = parse_machine(config, entry)
     machines[machine_id] = entry
-    temporary = path.with_name("machines.yaml.tmp")
-    temporary.write_text(yaml.safe_dump(data, sort_keys=False))
-    temporary.chmod(0o600)
-    os.replace(temporary, path)
+    _write_yaml(path, data)
     config.machines[machine_id] = machine
     view = machine.model_dump(mode="json", exclude={"password", "sudo_password"})
     return {"id": machine_id, **view, "key_path": entry.get("key_path")}
+
+
+def save_home_assistant(config: Config, changes: dict) -> None:
+    path = config.config_dir / "hub.yaml"
+    data = _read_yaml(path)
+    entry = _merge(data["home_assistant"], changes)
+    try:
+        settings = HomeAssistantConfig.model_validate(entry)
+    except ValidationError as error:
+        raise ConfigError(_error_message(error)) from error
+    data["home_assistant"] = entry
+    _write_yaml(path, data)
+    config.hub.home_assistant = settings

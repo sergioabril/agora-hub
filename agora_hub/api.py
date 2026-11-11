@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 from .config import Config, ConfigError, parse_machine, save_machine
 from .controller import Conflict, Controller
+from .home_assistant import HomeAssistant
+from .integrations import home_assistant_router
 from .schedule import run_schedule
 
 
@@ -20,7 +22,7 @@ class DeploymentAction(BaseModel):
     action: Literal["start", "stop"]
 
 
-def create_app(config: Config, controller: Controller) -> FastAPI:
+def create_app(config: Config, controller: Controller, home_assistant: HomeAssistant) -> FastAPI:
     async def authenticate(authorization: Annotated[str | None, Header()] = None):
         token = config.hub.api.admin_token
         if token is None:
@@ -103,4 +105,5 @@ def create_app(config: Config, controller: Controller) -> FastAPI:
             raise HTTPException(404, "Deployment not found")
         return await controller.deployment_action(deployment_id, body.action)
 
+    app.include_router(home_assistant_router(config, home_assistant))
     return app
