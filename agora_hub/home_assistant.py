@@ -2,7 +2,7 @@ import asyncio
 
 import httpx
 
-from .config import Config
+from .config import Config, HomeAssistantConfig
 
 
 class HomeAssistantError(Exception):
@@ -16,8 +16,10 @@ class HomeAssistant:
         self.config = config
         self.transport = transport
 
-    async def _request(self, method: str, path: str, body: dict | None = None):
-        settings = self.config.hub.home_assistant
+    async def _request(self, method: str, path: str, body: dict | None = None,
+                       settings: HomeAssistantConfig | None = None):
+        if settings is None:
+            settings = self.config.hub.home_assistant
         if settings.token is None:
             raise HomeAssistantError("not_configured", "home assistant token is not set")
         try:
@@ -32,6 +34,14 @@ class HomeAssistant:
                 return response.json()
         except (httpx.HTTPError, ValueError) as error:
             raise HomeAssistantError("http", str(error) or type(error).__name__) from error
+
+    async def check(self, settings: HomeAssistantConfig | None = None) -> dict:
+        try:
+            await self._request("GET", "/api/", settings=settings)
+        except HomeAssistantError as error:
+            reachable = isinstance(error.__cause__, (httpx.HTTPStatusError, ValueError))
+            return {"reachable": reachable, "error": f"{error.kind}: {error}"}
+        return {"reachable": True, "error": None}
 
     async def switches(self) -> list[dict]:
         states = await self._request("GET", "/api/states")

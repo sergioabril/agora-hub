@@ -3,7 +3,7 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, constr
 
-from .config import Config, ConfigError, save_home_assistant
+from .config import Config, ConfigError, parse_home_assistant, save_home_assistant
 from .controller import Conflict
 from .home_assistant import HomeAssistant, HomeAssistantError
 
@@ -21,7 +21,7 @@ def home_assistant_router(config: Config, home_assistant: HomeAssistant) -> APIR
         return {
             "host": settings.host,
             "port": settings.port,
-            "token_set": settings.token is not None,
+            "token": settings.token.get_secret_value() if settings.token else "",
             "power_cycle_delay_seconds": settings.power_cycle_delay_seconds,
         }
 
@@ -47,6 +47,14 @@ def home_assistant_router(config: Config, home_assistant: HomeAssistant) -> APIR
         except OSError as error:
             raise HTTPException(500, "cannot write hub.yaml") from error
         return view()
+
+    @router.post("/test")
+    async def test_settings(body: dict):
+        try:
+            settings = parse_home_assistant(config, body)
+        except ConfigError as error:
+            raise HTTPException(422, str(error)) from error
+        return await home_assistant.check(settings)
 
     @router.get("/switches")
     async def get_switches():

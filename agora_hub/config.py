@@ -240,14 +240,22 @@ def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
     return {"id": machine_id, **view, "key_path": entry.get("key_path")}
 
 
+def _home_assistant(entry: dict) -> HomeAssistantConfig:
+    try:
+        return HomeAssistantConfig.model_validate(entry)
+    except ValidationError as error:
+        raise ConfigError(_error_message(error)) from error
+
+
+def parse_home_assistant(config: Config, changes: dict) -> HomeAssistantConfig:
+    return _home_assistant(_merge(config.hub.home_assistant.model_dump(), changes))
+
+
 def save_home_assistant(config: Config, changes: dict) -> None:
     path = config.config_dir / "hub.yaml"
     data = _read_yaml(path)
     entry = _merge(data["home_assistant"], changes)
-    try:
-        settings = HomeAssistantConfig.model_validate(entry)
-    except ValidationError as error:
-        raise ConfigError(_error_message(error)) from error
+    settings = _home_assistant(entry)
     data["home_assistant"] = entry
     _write_yaml(path, data)
     config.hub.home_assistant = settings

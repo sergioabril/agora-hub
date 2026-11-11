@@ -33,7 +33,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_eleven_routes(api):
+async def test_auth_precedes_validation_and_only_twelve_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
@@ -46,7 +46,7 @@ async def test_auth_precedes_validation_and_only_eleven_routes(api):
     assert all(response.status_code == 404 for response in hidden)
     included = [route for item in app.routes if hasattr(item, "original_router") for route in item.original_router.routes]
     paths = [getattr(route, "path", "") for route in [*app.routes, *included]]
-    assert len([path for path in paths if path.startswith("/admin")]) == 11
+    assert len([path for path in paths if path.startswith("/admin")]) == 12
 
 
 async def test_empty_admin_token_disables_auth(config_dir):

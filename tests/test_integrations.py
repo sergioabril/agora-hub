@@ -26,6 +26,8 @@ def ha(config_dir):
         if failure:
             raise httpx.ConnectError("connection refused", request=request)
         requests.append(request)
+        if request.headers["Authorization"] == "Bearer wrong":
+            return httpx.Response(401)
         return httpx.Response(200, json=STATES if request.url.path == "/api/states" else [])
 
     config = load_config(config_dir)
@@ -50,16 +52,15 @@ async def test_settings_view_save_and_unset(ha):
         unset = await client.post(PATH, json={"token": None})
         count = len(requests)
         not_configured = await client.get(PATH + "/switches")
-    assert view.json() == {"host": "homeassistant.local", "port": 8123, "token_set": True,
+    assert view.json() == {"host": "homeassistant.local", "port": 8123, "token": "test-ha-token",
                            "power_cycle_delay_seconds": 5}
-    assert "test-ha-token" not in view.text and "test-ha-token" not in saved.text
     assert saved.status_code == 200 and saved.json()["host"] == "10.0.0.9"
     hub = yaml.safe_load(saved_text)
     assert hub["home_assistant"]["host"] == "10.0.0.9" and hub["home_assistant"]["port"] == 8124
     assert hub["home_assistant"]["token"] == "test-ha-token" and hub["api"]["admin_token"] == "a" * 64
     assert requests[0].url.host == "10.0.0.9" and requests[0].url.port == 8124
     assert bad.status_code == 422 and after_bad == saved_text
-    assert unset.json()["token_set"] is False
+    assert unset.json()["token"] == ""
     assert not_configured.status_code == 409
     assert not_configured.json()["detail"]["code"] == "home_assistant_not_configured"
     assert len(requests) == count
@@ -101,3 +102,28 @@ async def test_unreachable_home_assistant_is_502(ha):
     async with client:
         response = await client.get(PATH + "/switches")
     assert response.status_code == 502 and response.json()["detail"].startswith("http: ")
+
+
+async def test_connection_check_saves_nothing(ha):
+    config_dir, client, requests, failure = ha
+    before = (config_dir / "hub.yaml").read_text()
+    async with client:
+        ok = await client.post(PATH + "/test", json={})
+        wrong = await client.post(PATH + "/test", json={"host": "10.0.0.9", "token": "wrong"})
+        count = len(requests)
+        empty = await client.post(PATH + "/test", json={"token": ""})
+        after_empty = len(requests)
+        bad = await client.post(PATH + "/test", json={"host": "http://x"})
+        view = await client.get(PATH)
+        failure.append(True)
+        down = await client.post(PATH + "/test", json={})
+    assert ok.status_code == 200 and ok.json() == {"reachable": True, "error": None}
+    first, second = requests[0], requests[1]
+    assert (first.method, first.url.path, first.url.host, first.url.port) == ("GET", "/api/", "homeassistant.local", 8123)
+    assert first.headers["Authorization"] == "Bearer test-ha-token"
+    assert wrong.json()["reachable"] is True and wrong.json()["error"].startswith("http: ")
+    assert (second.url.host, second.url.port, second.headers["Authorization"]) == ("10.0.0.9", 8123, "Bearer wrong")
+    assert empty.json() == {"reachable": False, "error": "not_configured: home assistant token is not set"}
+    assert after_empty == count and bad.status_code == 422
+    assert (config_dir / "hub.yaml").read_text() == before and view.json()["host"] == "homeassistant.local"
+    assert down.json()["reachable"] is False and down.json()["error"].startswith("http: ")
