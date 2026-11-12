@@ -166,6 +166,11 @@ class Controller:
             key: {
                 "name": machine.name,
                 "host": machine.host,
+                "user": machine.user,
+                "port": machine.port,
+                "key_path": self._key_path(machine),
+                "plug_entity_id": machine.plug_entity_id,
+                "shutdown_command": machine.shutdown_command,
                 "device": machine.device,
                 **self.machine_observations[key],
                 "operation": self._operation(self.machine_operations.get(key)),
@@ -173,6 +178,12 @@ class Controller:
             for key, machine in self.config.machines.items()
         }
         return {"machines": machines, "active": self.active}
+
+    def _key_path(self, machine: MachineConfig) -> str | None:
+        if machine.key_path is None:
+            return None
+        path, config_dir = machine.key_path.resolve(), self.config.config_dir
+        return str(path.relative_to(config_dir) if path.is_relative_to(config_dir) else path)
 
     async def deployments_status(self) -> dict:
         keys = list(self.config.deployments)

@@ -87,7 +87,17 @@ async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     assert machines.status_code == deployments.status_code == 200
     assert machines.json()["machines"]["spark-1"]["reachable"] is True
     assert machines.json()["machines"]["spark-2"]["error"]
-    assert {"host": "spark-1.local", "device": "dgx-spark"}.items() <= machines.json()["machines"]["spark-1"].items()
+    spark = machines.json()["machines"]["spark-1"]
+    assert {
+        "host": "spark-1.local",
+        "user": "agora",
+        "port": 22,
+        "key_path": None,
+        "plug_entity_id": "switch.spark_1",
+        "shutdown_command": "sudo -S -p '' poweroff",
+        "device": "dgx-spark",
+    }.items() <= spark.items()
+    assert not [key for key in spark if "password" in key]
     assert secret not in body and "test-ha-token" not in body and "REPLACE_LOCALLY" not in body
     deployment = deployments.json()["deployments"]["pro"]
     assert set(("observed_state", "ready", "endpoint", "error", "operation")) <= set(deployment)
