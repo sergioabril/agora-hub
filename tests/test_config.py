@@ -13,7 +13,7 @@ def test_valid_config_loads(config_dir: Path):
     assert config.machines["spark-2"].port == 22
     assert config.machines["spark-2"].key_path is None
     assert config.machines["spark-2"].device == "dgx-spark"
-    assert config.deployments["pro"].status_command == "bash status.sh"
+    assert config.deployments["pro"].start_command == "/home/agora/pro/start.sh"
     assert config.hub.ssh.known_hosts_path == config_dir / "known_hosts"
 
 
@@ -22,6 +22,7 @@ def test_valid_config_loads(config_dir: Path):
     [
         ("deployments.yaml", lambda data: data["deployments"]["pro"].update(head="missing")),
         ("deployments.yaml", lambda data: data["deployments"]["pro"].update(head="spark-2", machines=["spark-1"])),
+        ("deployments.yaml", lambda data: data["deployments"]["pro"].update(start_command="start.sh")),
         ("hub.yaml", lambda data: data["schedule"].update(machines=["missing"])),
         ("hub.yaml", lambda data: data["schedule"].update(startup_deployment="missing")),
         ("hub.yaml", lambda data: data["schedule"].update(timezone="Nowhere/Imaginary")),

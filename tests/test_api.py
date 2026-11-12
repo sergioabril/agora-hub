@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 
 import httpx
@@ -22,7 +23,6 @@ def api(config_dir):
     config.hub.timeouts.deployment_start_seconds = 0.02
     config.hub.timeouts.readiness_poll_seconds = 0.001
     adapters = FakeAdapters()
-    adapters.states["pro"] = "stopped"
     controller = Controller(config, adapters)
     app = create_app(config, controller, HomeAssistant(config))
     headers = {"Authorization": "Bearer " + "a" * 64}
@@ -33,7 +33,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_twelve_routes(api):
+async def test_auth_precedes_validation_and_only_fifteen_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
@@ -46,7 +46,7 @@ async def test_auth_precedes_validation_and_only_twelve_routes(api):
     assert all(response.status_code == 404 for response in hidden)
     included = [route for item in app.routes if hasattr(item, "original_router") for route in item.original_router.routes]
     paths = [getattr(route, "path", "") for route in [*app.routes, *included]]
-    assert len([path for path in paths if path.startswith("/admin")]) == 12
+    assert len([path for path in paths if path.startswith("/admin")]) == 15
 
 
 async def test_empty_admin_token_disables_auth(config_dir):
@@ -79,7 +79,7 @@ async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     secret = config.hub.api.admin_token.get_secret_value()
     adapters.reachable["spark-1"] = True
     adapters.failures[("observe", "spark-2")] = AdapterError("connect", f"failed {secret}")
-    adapters.failures[("deployment_status", "pro")] = AdapterError("command", f"bad {secret}")
+    adapters.failures[("ready", "pro")] = AdapterError("http", f"bad {secret}")
     async with client(app) as request:
         machines = await request.get("/admin/machines/status", headers=headers)
         deployments = await request.get("/admin/deployments/status", headers=headers)
@@ -90,10 +90,10 @@ async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     assert {"host": "spark-1.local", "device": "dgx-spark"}.items() <= machines.json()["machines"]["spark-1"].items()
     assert secret not in body and "test-ha-token" not in body and "REPLACE_LOCALLY" not in body
     deployment = deployments.json()["deployments"]["pro"]
-    assert set(("observed_state", "ready", "endpoint", "errors", "operation")) <= set(deployment)
+    assert set(("observed_state", "ready", "endpoint", "error", "operation")) <= set(deployment)
     assert deployment["machines"] == ["spark-1", "spark-2", "spark-3", "spark-4"]
     assert deployment["head"] == "spark-1"
-    assert not [call for call in adapters.calls if call[0] in {"wake", "shutdown", "run"}]
+    assert not [call for call in adapters.calls if call[0] in {"wake", "shutdown", "stream"}]
     await controller.close()
 
 
@@ -118,14 +118,34 @@ async def test_concurrent_posts_accept_one_and_report_conflict(api):
     await controller.task
 
 
+async def test_start_streams_ndjson_and_output_replays(api):
+    config, adapters, controller, app, headers = api
+    start = config.deployments["pro"].start_command
+    adapters.stream_lines[("spark-1", start)] = [("stdout", "loading weights")]
+    adapters.run_hooks[("spark-1", start)] = lambda: adapters.readiness.update(pro=True)
+    async with client(app) as request:
+        response = await request.post("/admin/deployments/pro", json={"action": "start"}, headers=headers)
+        output = await request.get("/admin/deployments/pro/output", headers=headers)
+    events = [json.loads(line) for line in response.text.splitlines()]
+    texts = [event["text"] for event in events if event["type"] == "line"]
+    assert response.status_code == 202
+    assert response.headers["content-type"] == "application/x-ndjson"
+    assert events[0]["operation"]["status"] == "in_progress"
+    assert events[-1] == {"type": "end", "operation": events[-1]["operation"]}
+    assert events[-1]["operation"]["status"] == "succeeded"
+    assert {f"running {start} on spark-1", "loading weights", "ready"} <= set(texts)
+    assert output.status_code == 200
+    assert [json.loads(line).get("text") for line in output.text.splitlines()][1:-1] == texts
+
+
 async def test_machine_off_dependency_conflict_has_remote_state(api):
     _, adapters, _, app, headers = api
-    adapters.states["pro"] = "running"
     adapters.readiness["pro"] = True
     async with client(app) as request:
         response = await request.post("/admin/machines/spark-1", json={"action": "off"}, headers=headers)
         status = await request.get("/admin/deployments/status", headers=headers)
     assert response.status_code == 409
+    assert response.json()["detail"]["message"] == "machine is running deployment Pro; stop it first"
     assert response.json()["detail"]["blocking"] == {"deployment": "pro"}
     assert status.json()["deployments"]["pro"]["observed_state"] == "running"
     assert not [call for call in adapters.calls if call[0] == "shutdown"]
@@ -243,3 +263,37 @@ async def test_update_busy_machine_conflicts(api):
     await controller.task
     assert started.status_code == 202
     assert busy.status_code == 409 and busy.json()["detail"]["code"] == "machine_busy"
+
+
+NEW_DEPLOYMENT = {"name": "Mini", "machines": ["spark-1"], "head": "spark-1", "start_command": "/opt/mini/start.sh --tp 1",
+                  "stop_command": "/opt/mini/stop.sh", "endpoint": "http://spark-1.local:9000/v1/models"}
+
+
+async def test_add_and_update_deployment_write_file(api):
+    config, _, _, app, headers = api
+    async with client(app) as request:
+        added = await request.post("/admin/deployments/add", json=NEW_DEPLOYMENT, headers=headers)
+        deployment_id = added.json()["id"]
+        status = await request.get("/admin/deployments/status", headers=headers)
+        updated = await request.post(f"/admin/deployments/{deployment_id}/update", json={"name": "Tiny"}, headers=headers)
+    assert added.status_code == 201 and added.json() == {"id": deployment_id, **NEW_DEPLOYMENT}
+    assert status.json()["deployments"][deployment_id]["name"] == "Mini"
+    assert updated.status_code == 200 and config.deployments[deployment_id].name == "Tiny"
+    stored = yaml.safe_load((config.config_dir / "deployments.yaml").read_text())["deployments"]
+    assert stored[deployment_id] == {**NEW_DEPLOYMENT, "name": "Tiny"} and "pro" in stored
+
+
+async def test_update_deployment_rejects_invalid_and_busy(api):
+    config, adapters, controller, app, headers = api
+    held = asyncio.Event()
+    adapters.delays[("stream", "spark-1")] = held
+    async with client(app) as request:
+        invalid = await request.post("/admin/deployments/pro/update", json={"head": "spark-9"}, headers=headers)
+        await controller.deployment_action("pro", "start")
+        busy = await request.post("/admin/deployments/pro/update", json={"name": "X"}, headers=headers)
+    held.set()
+    await controller.task
+    assert invalid.status_code == 422 and config.deployments["pro"].head == "spark-1"
+    assert busy.status_code == 409
+    assert busy.json()["detail"] == {"code": "deployment_busy", "message": "deployment has an active operation",
+                                     "blocking": {"action": "start", "target": "pro", "machines": config.deployments["pro"].machines}}

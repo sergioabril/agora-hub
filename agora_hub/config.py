@@ -1,6 +1,7 @@
 import os
 import re
 import secrets
+import shlex
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -11,8 +12,7 @@ from pydantic import ValidationError, constr, field_validator, model_validator
 
 ConfigId = constr(pattern=r"^[a-z0-9][a-z0-9_-]*$")
 HubTime = constr(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-ReadinessPath = constr(pattern=r"^/")
-MachineName = constr(strip_whitespace=True, min_length=1)
+Name = constr(strip_whitespace=True, min_length=1)
 HostName = constr(pattern=r"^[A-Za-z0-9.-]+$")  # IP or hostname, no scheme/port/path
 
 
@@ -81,7 +81,6 @@ class ScheduleConfig(Model):
 
 class TimeoutsConfig(Model):
     ssh_connect_seconds: PositiveFloat
-    status_command_seconds: PositiveFloat
     http_seconds: PositiveFloat
     machine_boot_seconds: PositiveFloat
     machine_shutdown_seconds: PositiveFloat
@@ -99,7 +98,7 @@ class HubConfig(Model):
 
 
 class MachineConfig(Model):
-    name: MachineName
+    name: Name
     host: str
     user: str
     port: int = 22
@@ -117,21 +116,39 @@ class MachineConfig(Model):
         return self
 
 
-class ReadinessConfig(Model):
-    path: ReadinessPath
-    expected_status: int
-
-
 class DeploymentConfig(Model):
-    name: str
+    name: Name
     machines: list[str]
     head: str
-    working_directory: str
     start_command: str
     stop_command: str
-    status_command: str | None = None
     endpoint: HttpUrl
-    readiness: ReadinessConfig
+
+    @field_validator("start_command", "stop_command")
+    @classmethod
+    def absolute_command(cls, value: str) -> str:
+        words = shlex.split(value)  # ValueError on unbalanced quotes
+        if not words or not words[0].startswith("/"):
+            raise ValueError("must start with an absolute path")
+        return value
+
+
+def check_deployments(
+    machine_ids: set[str], deployments: dict[str, DeploymentConfig], schedule: ScheduleConfig
+) -> None:
+    if "add" in deployments:
+        raise ValueError("deployment id add is reserved")
+    if schedule.startup_deployment not in set(deployments) | {None}:
+        raise ValueError(f"unknown schedule deployment: {schedule.startup_deployment}")
+    for deployment_id, deployment in deployments.items():
+        if unknown := set(deployment.machines) - machine_ids:
+            raise ValueError(f"unknown machine in {deployment_id}: {sorted(unknown)[0]}")
+        if deployment.head not in deployment.machines:
+            raise ValueError(f"head is not in machines for {deployment_id}")
+    if schedule.startup_deployment:
+        startup = deployments[schedule.startup_deployment]
+        if not set(startup.machines) <= set(schedule.machines):
+            raise ValueError("startup_deployment machines must be schedule machines")
 
 
 class Config(Model):
@@ -153,17 +170,7 @@ class Config(Model):
         schedule = self.hub.schedule
         if unknown := set(schedule.machines) - machine_ids:
             raise ValueError(f"unknown schedule machine: {sorted(unknown)[0]}")
-        if schedule.startup_deployment not in set(self.deployments) | {None}:
-            raise ValueError(f"unknown schedule deployment: {schedule.startup_deployment}")
-        for deployment_id, deployment in self.deployments.items():
-            if unknown := set(deployment.machines) - machine_ids:
-                raise ValueError(f"unknown machine in {deployment_id}: {sorted(unknown)[0]}")
-            if deployment.head not in deployment.machines:
-                raise ValueError(f"head is not in machines for {deployment_id}")
-        if schedule.startup_deployment:
-            startup = self.deployments[schedule.startup_deployment]
-            if not set(startup.machines) <= set(schedule.machines):
-                raise ValueError("startup_deployment machines must be schedule machines")
+        check_deployments(machine_ids, self.deployments, schedule)
         return self
 
 
@@ -238,6 +245,29 @@ def save_machine(config: Config, machine_id: str | None, changes: dict) -> dict:
     config.machines[machine_id] = machine
     view = machine.model_dump(mode="json", exclude={"password", "sudo_password"})
     return {"id": machine_id, **view, "key_path": entry.get("key_path")}
+
+
+def save_deployment(config: Config, deployment_id: str | None, changes: dict) -> dict:
+    path = config.config_dir / "deployments.yaml"
+    data = _read_yaml(path)
+    deployments = data["deployments"]
+    if deployment_id is None:
+        deployment_id = secrets.token_hex(4)
+        while deployment_id in config.deployments or deployment_id in deployments:
+            deployment_id = secrets.token_hex(4)
+    entry = _merge(deployments.get(deployment_id) or {}, changes)
+    try:
+        deployment = DeploymentConfig.model_validate(entry)
+    except ValidationError as error:
+        raise ConfigError(_error_message(error)) from error
+    try:
+        check_deployments(set(config.machines), {**config.deployments, deployment_id: deployment}, config.hub.schedule)
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    deployments[deployment_id] = entry
+    _write_yaml(path, data)
+    config.deployments[deployment_id] = deployment
+    return {"id": deployment_id, **deployment.model_dump(mode="json")}
 
 
 def _home_assistant(entry: dict) -> HomeAssistantConfig:

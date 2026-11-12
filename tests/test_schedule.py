@@ -118,7 +118,7 @@ async def test_disabled_schedule_only_reads_status(config):
 
     await run_schedule(config, controller, lambda: datetime(2026, 1, 15, tzinfo=UTC), sleep)
     assert not slept
-    assert {call[0] for call in adapters.calls} == {"observe", "deployment_status", "ready"}
+    assert {call[0] for call in adapters.calls} == {"observe", "ready"}
 
 
 @pytest.mark.asyncio
@@ -134,7 +134,7 @@ async def test_null_startup_deployment_only_wakes_machines(config):
         await run_schedule(config, controller, lambda: datetime(2026, 1, 15, 10, tzinfo=UTC), stop)
     await controller.task
     assert {call[1] for call in adapters.calls if call[0] == "wake"} == set(config.hub.schedule.machines)
-    assert not [call for call in adapters.calls if call[0] == "run"]
+    assert not [call for call in adapters.calls if call[0] == "stream"]
 
 
 @pytest.mark.parametrize(
@@ -166,7 +166,7 @@ async def test_action_settles_then_no_calls_or_reconciliation_until_transition(c
     if wake_fails:
         adapters.failures[("wake", "spark-2")] = AdapterError("http", "plug failed")
     else:
-        adapters.run_hooks[("spark-1", "bash start.sh")] = lambda: adapters.readiness.update(pro=True)
+        adapters.run_hooks[("spark-1", config.deployments["pro"].start_command)] = lambda: adapters.readiness.update(pro=True)
     controller = Controller(config, adapters)
     clock = Clock(datetime(2026, 1, 15, 10, tzinfo=UTC), 1)
     first_count = None

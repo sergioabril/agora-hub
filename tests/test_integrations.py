@@ -10,7 +10,7 @@ from agora_hub.controller import Controller
 from agora_hub.home_assistant import HomeAssistant
 from tests.fakes import FakeAdapters
 
-STATES = [
+ENTITIES = [
     {"entity_id": "switch.spark_1", "state": "on", "attributes": {"friendly_name": "Spark 1 plug"}},
     {"entity_id": "switch.lamp", "state": "unavailable", "attributes": {}},
     {"entity_id": "light.desk", "state": "on", "attributes": {"friendly_name": "Desk"}},
@@ -28,7 +28,7 @@ def ha(config_dir):
         requests.append(request)
         if request.headers["Authorization"] == "Bearer wrong":
             return httpx.Response(401)
-        return httpx.Response(200, json=STATES if request.url.path == "/api/states" else [])
+        return httpx.Response(200, json=ENTITIES if request.url.path == "/api/states" else [])
 
     config = load_config(config_dir)
     home_assistant = HomeAssistant(config, httpx.MockTransport(handler))

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 
@@ -31,12 +32,6 @@ class Conflict(Exception):
         super().__init__(message)
 
 
-class _ActionError(RuntimeError):
-    def __init__(self, message: str, output: str = ""):
-        self.output = output
-        super().__init__(message)
-
-
 class Controller:
     def __init__(self, config: Config, adapters: Adapters):
         self.config = config
@@ -47,6 +42,8 @@ class Controller:
         self.deployment_operations: dict[str, Operation] = {}
         self.machine_observations: dict[str, dict] = {}
         self.deployment_observations: dict[str, dict] = {}
+        self.logs: dict[str, dict] = {}  # deployment_id -> {"entries": deque, "count": total appended}
+        self.changed = asyncio.Event()  # replaced on every new line or finished operation
         self.shutdown_requested = {machine_id: False for machine_id in config.machines}
 
     def _operation(self, operation: Operation | None) -> dict | None:
@@ -64,11 +61,47 @@ class Controller:
         prefix = f"{error.kind}: " if isinstance(error, AdapterError) else ""
         return redact(prefix + str(error), self.config)
 
+    def _notify(self) -> None:
+        self.changed.set()
+        self.changed = asyncio.Event()
+
+    def _begin(self, deployment_id: str, action: str) -> Operation:
+        self.logs[deployment_id] = {"entries": deque(maxlen=2000), "count": 0}
+        self.deployment_operations[deployment_id] = Operation(action)
+        return self.deployment_operations[deployment_id]
+
+    def _log(self, deployment_id: str, source: str, text: str) -> str:
+        text = redact(text, self.config).rstrip("\r\n")[:2000]
+        log = self.logs[deployment_id]
+        log["entries"].append({"source": source, "text": text, "at": _now()})
+        log["count"] += 1
+        self._notify()
+        return text
+
+    def follow(self, deployment_id: str):
+        operation = self.deployment_operations[deployment_id]
+        log = self.logs[deployment_id]
+        first = {"type": "operation", "operation": asdict(operation)}
+
+        async def events():
+            yield first
+            sent = 0
+            while True:
+                changed = self.changed
+                entries, count, finished = list(log["entries"]), log["count"], operation.finished_at
+                for entry in entries[max(len(entries) - (count - sent), 0):]:
+                    yield {"type": "line", **entry}
+                sent = count
+                if finished:
+                    yield {"type": "end", "operation": asdict(operation)}
+                    return
+                await changed.wait()
+
+        return events()
+
     async def _run_operation(self, operation: Operation, coroutine) -> bool:
         try:
-            output = await coroutine
-            if output:
-                operation.output = redact(str(output), self.config)[-4000:]
+            await coroutine
             operation.status = "succeeded"
             operation.error = None
             return True
@@ -78,11 +111,10 @@ class Controller:
         except Exception as error:
             operation.status = "failed"
             operation.error = self._error(error)
-            if output := getattr(error, "output", ""):
-                operation.output = redact(output, self.config)[-4000:]
             return False
         finally:
             operation.finished_at = _now()
+            self._notify()
 
     async def test_login(self, machine: MachineConfig) -> dict:
         try:
@@ -110,39 +142,23 @@ class Controller:
         return observation
 
     async def _observe_deployment(self, deployment_id: str) -> dict:
-        deployment = self.config.deployments[deployment_id]
-        errors = []
-        script_state = None
-        calls = [self.adapters.ready(deployment_id)]
-        if deployment.status_command:
-            calls.insert(0, self.adapters.deployment_status(deployment_id))
-        results = await asyncio.gather(*calls, return_exceptions=True)
-        ready_result = results[-1]
-        ready = not isinstance(ready_result, BaseException)
-        if not ready:
-            errors.append(self._error(ready_result))
-        if deployment.status_command:
-            status_result = results[0]
-            if isinstance(status_result, BaseException):
-                errors.insert(0, self._error(status_result))
-                script_state = "unknown"
-            else:
-                script_state = status_result
-        observed_state = script_state if script_state is not None else ("running" if ready else "unknown")
-        discrepancy = script_state is not None and (script_state == "running") != ready
-        observation = {
-            "observed_state": observed_state,
-            "script_state": script_state,
-            "ready": ready,
-            "discrepancy": discrepancy,
-            "errors": errors,
-            "checked_at": _now(),
-        }
+        try:
+            await self.adapters.ready(deployment_id)
+            ready, error = True, None
+        except AdapterError as caught:
+            ready, error = False, self._error(caught)
+        observation = {"ready": ready, "error": error, "checked_at": _now()}
         self.deployment_observations[deployment_id] = observation
         return observation
 
-    def _deployment_active(self, observation: dict) -> bool:
-        return observation["script_state"] in ("starting", "running", "stopping") or observation["ready"]
+    def _in_progress(self, deployment_id: str) -> Operation | None:
+        operation = self.deployment_operations.get(deployment_id)
+        return operation if operation and operation.status == "in_progress" else None
+
+    def _observed_state(self, deployment_id: str) -> str:
+        if operation := self._in_progress(deployment_id):
+            return "starting" if operation.action == "start" else "stopping"
+        return "running" if self.deployment_observations[deployment_id]["ready"] else "stopped"
 
     async def machines_status(self) -> dict:
         await asyncio.gather(*(self._observe_machine(key) for key in self.config.machines))
@@ -159,14 +175,19 @@ class Controller:
         return {"machines": machines, "active": self.active}
 
     async def deployments_status(self) -> dict:
-        await asyncio.gather(*(self._observe_deployment(key) for key in self.config.deployments))
+        keys = list(self.config.deployments)
+        await asyncio.gather(*(self._observe_deployment(key) for key in keys))
         deployments = {}
-        for key, deployment in self.config.deployments.items():
+        for key in keys:
+            deployment = self.config.deployments[key]
             deployments[key] = {
                 "name": deployment.name,
-                "endpoint": str(deployment.endpoint),
                 "machines": list(deployment.machines),
                 "head": deployment.head,
+                "start_command": deployment.start_command,
+                "stop_command": deployment.stop_command,
+                "endpoint": str(deployment.endpoint),
+                "observed_state": self._observed_state(key),
                 **self.deployment_observations[key],
                 "operation": self._operation(self.deployment_operations.get(key)),
             }
@@ -198,18 +219,36 @@ class Controller:
     async def _fail(self, message: str) -> None:
         raise RuntimeError(message)
 
-    async def _wake(self, machine_id: str) -> None:
+    async def _wake(self, machine_id: str, deployment_id: str | None = None) -> None:
         observation = await self._observe_machine(machine_id)
         if observation["reachable"] and not observation["error"]:
             return
         operation = self.machine_operations[machine_id] = Operation("on")
         work = self._fail(observation["error"]) if observation["reachable"] else self._power_on(machine_id)
-        await self._run_operation(operation, work)
+        if deployment_id and not observation["reachable"]:
+            self._log(deployment_id, "hub", f"waking {machine_id}")
+        if await self._run_operation(operation, work) and deployment_id:
+            self._log(deployment_id, "hub", f"{machine_id} is up")
+
+    async def _script(self, deployment_id: str, command: str, timeout: float) -> int:
+        head = self.config.deployments[deployment_id].head
+        self._log(deployment_id, "hub", f"running {command} on {head}")
+        lines = deque(maxlen=4000)  # enough lines for the last 4,000 characters
+
+        def on_line(source: str, text: str) -> None:
+            lines.append(self._log(deployment_id, source, text))
+
+        try:
+            status = await self.adapters.stream(head, command, timeout=timeout, on_line=on_line)
+        finally:
+            self.deployment_operations[deployment_id].output = "\n".join(lines)[-4000:]
+        self._log(deployment_id, "hub", f"exited {status}")
+        return status
 
     async def _start(self, deployment_id: str, wake: bool = True) -> None:
         deployment = self.config.deployments[deployment_id]
         if wake:
-            await asyncio.gather(*(self._wake(machine_id) for machine_id in deployment.machines))
+            await asyncio.gather(*(self._wake(machine_id, deployment_id) for machine_id in deployment.machines))
         unavailable = []
         for machine_id in deployment.machines:
             observation = self.machine_observations[machine_id]
@@ -219,36 +258,25 @@ class Controller:
             raise RuntimeError("unavailable machines: " + ", ".join(unavailable))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.config.hub.timeouts.deployment_start_seconds
-        result = await self.adapters.run(
-            deployment.head,
-            deployment.start_command,
-            cwd=deployment.working_directory,
-            timeout=self.config.hub.timeouts.deployment_start_seconds,
-        )
-        output = result.stdout + result.stderr
-        if result.exit_status:
-            raise _ActionError(f"start command exited {result.exit_status}: {output}", output)
+        status = await self._script(deployment_id, deployment.start_command, max(deadline - loop.time(), 0))
+        if status:
+            raise RuntimeError(f"start command exited {status}")
+        self._log(deployment_id, "hub", f"waiting for {deployment.endpoint}")
         while True:
             observation = await self._observe_deployment(deployment_id)
             if observation["ready"]:
-                return output
+                self._log(deployment_id, "hub", "ready")
+                return
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise _ActionError("deployment readiness timed out; outcome unknown", output)
+                raise RuntimeError("endpoint did not answer 2xx before timeout; outcome unknown")
             await asyncio.sleep(min(self.config.hub.timeouts.readiness_poll_seconds, remaining))
 
-    async def _stop(self, deployment_id: str) -> str:
-        deployment = self.config.deployments[deployment_id]
-        result = await self.adapters.run(
-            deployment.head,
-            deployment.stop_command,
-            cwd=deployment.working_directory,
-            timeout=self.config.hub.timeouts.deployment_stop_seconds,
-        )
-        output = result.stdout + result.stderr
-        if result.exit_status:
-            raise _ActionError(f"stop command exited {result.exit_status}: {output}", output)
-        return output
+    async def _stop(self, deployment_id: str) -> None:
+        command = self.config.deployments[deployment_id].stop_command
+        status = await self._script(deployment_id, command, self.config.hub.timeouts.deployment_stop_seconds)
+        if status:
+            raise RuntimeError(f"stop command exited {status}")
 
     def _launch(self, body) -> None:
         async def guarded():
@@ -259,7 +287,17 @@ class Controller:
 
         self.task = asyncio.create_task(guarded())
 
+    def _running_conflict(self, deployment_id: str) -> Conflict:
+        name = self.config.deployments[deployment_id].name
+        message = f"machine is running deployment {name}; stop it first"
+        return Conflict("deployment_active", message, {"deployment": deployment_id})
+
     async def machine_action(self, machine_id: str, action: str) -> dict:
+        members = [key for key, deployment in self.config.deployments.items() if machine_id in deployment.machines]
+        if action == "off":
+            for deployment_id in members:
+                if self._in_progress(deployment_id):
+                    raise self._running_conflict(deployment_id)
         self._reserve(action, machine_id, [machine_id])
         try:
             if action == "on":
@@ -267,18 +305,9 @@ class Controller:
                 if observation["reachable"]:
                     raise Conflict("machine_on", "machine is already on", {"machine": machine_id})
             else:
-                for deployment_id, deployment in self.config.deployments.items():
-                    if machine_id not in deployment.machines:
-                        continue
-                    observation = await self._observe_deployment(deployment_id)
-                    if self._deployment_active(observation):
-                        raise Conflict("deployment_active", "deployment must be stopped first", {"deployment": deployment_id})
-                    stopped = not deployment.status_command and (
-                        (operation := self.deployment_operations.get(deployment_id)) is not None
-                        and operation.action == "stop" and operation.status == "succeeded"
-                    )
-                    if observation["observed_state"] == "unknown" and not stopped:
-                        raise Conflict("deployment_state_unknown", "deployment state is unknown", {"deployment": deployment_id})
+                for deployment_id in members:
+                    if (await self._observe_deployment(deployment_id))["ready"]:
+                        raise self._running_conflict(deployment_id)
             operation = self.machine_operations[machine_id] = Operation(action)
             work = self._power_on(machine_id) if action == "on" else self._power_off(machine_id)
             self._launch(self._run_operation(operation, work))
@@ -292,9 +321,9 @@ class Controller:
         self._reserve(action, deployment_id, deployment.machines)
         try:
             observation = await self._observe_deployment(deployment_id)
-            if action == "start" and self._deployment_active(observation):
+            if action == "start" and observation["ready"]:
                 raise Conflict("deployment_active", "deployment is already active", {"deployment": deployment_id})
-            operation = self.deployment_operations[deployment_id] = Operation(action)
+            operation = self._begin(deployment_id, action)
             work = self._start(deployment_id) if action == "start" else self._stop(deployment_id)
             self._launch(self._run_operation(operation, work))
             return self._operation(operation)
@@ -315,10 +344,9 @@ class Controller:
             deployment_id = schedule.startup_deployment
             if not deployment_id:
                 return
-            observation = await self._observe_deployment(deployment_id)
-            if self._deployment_active(observation):
+            if (await self._observe_deployment(deployment_id))["ready"]:
                 return
-            operation = self.deployment_operations[deployment_id] = Operation("start")
+            operation = self._begin(deployment_id, "start")
             await self._run_operation(operation, self._start(deployment_id, wake=False))
 
         self._launch(work())
@@ -332,7 +360,7 @@ class Controller:
             for deployment_id, deployment in self.config.deployments.items():
                 if not set(deployment.machines) & set(schedule.machines):
                     continue
-                operation = self.deployment_operations[deployment_id] = Operation("stop")
+                operation = self._begin(deployment_id, "stop")
                 await self._run_operation(operation, self._stop(deployment_id))
 
             async def shut(machine_id: str):

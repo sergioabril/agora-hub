@@ -23,6 +23,10 @@ class FakeConnection:
             raise self.error
         return self.result
 
+    async def create_process(self, command, **kwargs):
+        self.runs.append((command, kwargs))
+        return self.process
+
     def close(self):
         self.closed = True
 
@@ -117,7 +121,7 @@ async def test_wake_failure_stops_before_turn_on(config, monkeypatch):
     assert paths == ["/api/services/switch/turn_off"]
 
 
-@pytest.mark.parametrize("status, succeeds", [(200, True), (503, False)])
+@pytest.mark.parametrize("status, succeeds", [(204, True), (404, False)])
 async def test_readiness_status(config, status, succeeds):
     transport = httpx.MockTransport(lambda request: httpx.Response(status))
     adapters = make_adapters(config, transport)
@@ -139,36 +143,6 @@ async def test_readiness_connection_error_is_redacted(config):
     assert caught.value.kind == "http"
     assert "test-ha-token" not in str(caught.value)
     assert "***" in str(caught.value)
-
-
-async def test_status_script_returns_valid_state(config, monkeypatch):
-    connection = FakeConnection(SimpleNamespace(exit_status=0, stdout=" running\n", stderr=""))
-    install_ssh(monkeypatch, connection)
-    assert await make_adapters(config).deployment_status("pro") == "running"
-    command, kwargs = connection.runs[0]
-    assert command == "cd /home/agora/pro && bash status.sh"
-    assert kwargs["timeout"] == 10
-
-
-@pytest.mark.parametrize(
-    "result",
-    [
-        SimpleNamespace(exit_status=0, stdout="healthy\n", stderr=""),
-        SimpleNamespace(exit_status=4, stdout="", stderr="broken"),
-    ],
-)
-async def test_status_script_rejects_invalid_output_and_nonzero(config, monkeypatch, result):
-    install_ssh(monkeypatch, FakeConnection(result))
-    with pytest.raises(AdapterError) as caught:
-        await make_adapters(config).deployment_status("pro")
-    assert caught.value.kind == "command"
-
-
-async def test_status_script_timeout(config, monkeypatch):
-    install_ssh(monkeypatch, FakeConnection(error=asyncio.TimeoutError()))
-    with pytest.raises(AdapterError) as caught:
-        await make_adapters(config).deployment_status("pro")
-    assert caught.value.kind == "timeout"
 
 
 @pytest.mark.parametrize(
@@ -251,3 +225,29 @@ async def test_run_without_exit_status_is_unknown(config, monkeypatch):
     outcome = await make_adapters(config).run("spark-1", "thing", timeout=1)
     assert outcome.exit_status == -1
     assert outcome.stdout == "partial ***"
+
+
+class FakeProcess:
+    def __init__(self, stdout, stderr, exit_status):
+        async def lines(items):
+            for item in items:
+                await asyncio.sleep(0)
+                yield item
+
+        self.stdout, self.stderr, self.exit_status = lines(stdout), lines(stderr), exit_status
+        self.stdin = SimpleNamespace(write_eof=lambda: setattr(self, "eof", True))
+
+    async def wait_closed(self):
+        pass
+
+
+async def test_stream_delivers_redacted_lines_and_exit_status(config, monkeypatch):
+    connection = FakeConnection()
+    connection.process = FakeProcess(["loading REPLACE_LOCALLY\n", "done\r\n"], ["warn test-ha-token\n"], 3)
+    install_ssh(monkeypatch, connection)
+    lines = []
+    status = await make_adapters(config).stream("spark-1", "/start.sh", timeout=1, on_line=lambda *line: lines.append(line))
+    assert status == 3
+    assert connection.runs == [("/start.sh", {"encoding": "utf-8", "errors": "replace"})]
+    assert connection.process.eof and connection.closed
+    assert sorted(lines) == [("stderr", "warn ***"), ("stdout", "done"), ("stdout", "loading ***")]

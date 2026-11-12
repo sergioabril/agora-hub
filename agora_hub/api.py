@@ -1,13 +1,14 @@
 import asyncio
+import json
 import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .config import Config, ConfigError, parse_machine, save_machine
+from .config import Config, ConfigError, parse_machine, save_deployment, save_machine
 from .controller import Conflict, Controller
 from .home_assistant import HomeAssistant
 from .integrations import home_assistant_router
@@ -61,13 +62,13 @@ def create_app(config: Config, controller: Controller, home_assistant: HomeAssis
     async def machines_status():
         return await controller.machines_status()
 
-    def save(machine_id: str | None, body: dict) -> dict:
+    def save(machine_id: str | None, body: dict, kind: str = "machines") -> dict:
         try:
-            return save_machine(config, machine_id, body)
+            return (save_machine if kind == "machines" else save_deployment)(config, machine_id, body)
         except ConfigError as error:
             raise HTTPException(422, str(error)) from error
         except OSError as error:
-            raise HTTPException(500, "cannot write machines.yaml") from error
+            raise HTTPException(500, f"cannot write {kind}.yaml") from error
 
     @app.post("/admin/machines/add", status_code=201)
     async def add_machine(body: dict):
@@ -99,11 +100,39 @@ def create_app(config: Config, controller: Controller, home_assistant: HomeAssis
     async def deployments_status():
         return await controller.deployments_status()
 
+    def stream(deployment_id: str, status_code: int) -> StreamingResponse:
+        lines = (json.dumps(event) + "\n" async for event in controller.follow(deployment_id))
+        return StreamingResponse(lines, status_code, media_type="application/x-ndjson")
+
+    @app.post("/admin/deployments/add", status_code=201)
+    async def add_deployment(body: dict):
+        return save(None, body, "deployments")
+
+    @app.post("/admin/deployments/{deployment_id}/update")
+    async def update_deployment(deployment_id: str, body: dict):
+        if deployment_id not in config.deployments:
+            raise HTTPException(404, "Deployment not found")
+        operation = controller.deployment_operations.get(deployment_id)
+        if (controller.active and controller.active["target"] == deployment_id) or (
+            operation and operation.status == "in_progress"
+        ):
+            raise Conflict("deployment_busy", "deployment has an active operation", dict(controller.active or {}))
+        return save(deployment_id, body, "deployments")
+
     @app.post("/admin/deployments/{deployment_id}", status_code=202)
     async def deployment_action(deployment_id: str, body: DeploymentAction):
         if deployment_id not in config.deployments:
             raise HTTPException(404, "Deployment not found")
-        return await controller.deployment_action(deployment_id, body.action)
+        await controller.deployment_action(deployment_id, body.action)
+        return stream(deployment_id, 202)
+
+    @app.get("/admin/deployments/{deployment_id}/output")
+    async def deployment_output(deployment_id: str):
+        if deployment_id not in config.deployments:
+            raise HTTPException(404, "Deployment not found")
+        if deployment_id not in controller.deployment_operations:
+            raise HTTPException(404, "No operation")
+        return stream(deployment_id, 200)
 
     app.include_router(home_assistant_router(config, home_assistant))
     return app

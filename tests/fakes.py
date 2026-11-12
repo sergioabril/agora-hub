@@ -6,12 +6,12 @@ from agora_hub.adapters import AdapterError, CommandResult
 class FakeAdapters:
     def __init__(self):
         self.reachable: dict[str, bool] = {}
-        self.states: dict[str, str] = {}
-        self.readiness: dict[str, bool] = {}
+        self.readiness = {}  # deployment_id -> endpoint answers 2xx
         self.failures: dict[tuple[str, str], AdapterError] = {}
         self.delays: dict[tuple[str, str], asyncio.Event] = {}
         self.calls: list[tuple] = []
-        self.run_results: dict[tuple[str, str], CommandResult] = {}
+        self.stream_lines: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        self.stream_exits: dict[tuple[str, str], int] = {}
         self.run_hooks: dict[tuple[str, str], object] = {}
 
     async def _call(self, action: str, target: str) -> None:
@@ -26,15 +26,17 @@ class FakeAdapters:
         if not self.reachable.get(machine_id, False):
             raise AdapterError("connect", "unreachable")
 
-    async def run(self, machine_id, command, *, cwd=None, timeout, stdin=None):
-        self.calls.append(("run", machine_id, command))
-        if event := self.delays.get(("run", machine_id, command)) or self.delays.get(("run", machine_id)):
+    async def stream(self, machine_id, command, *, timeout, on_line):
+        self.calls.append(("stream", machine_id, command))
+        if event := self.delays.get(("stream", machine_id, command)) or self.delays.get(("stream", machine_id)):
             await event.wait()
-        if error := self.failures.get(("run", machine_id, command)) or self.failures.get(("run", machine_id)):
+        if error := self.failures.get(("stream", machine_id, command)) or self.failures.get(("stream", machine_id)):
             raise error
+        for source, text in self.stream_lines.get((machine_id, command), []):
+            on_line(source, text)
         if hook := self.run_hooks.get((machine_id, command)):
             hook()
-        return self.run_results.get((machine_id, command), CommandResult(0, "", ""))
+        return self.stream_exits.get((machine_id, command), 0)
 
     async def login(self, machine) -> None:
         await self._call("login", machine.host)
@@ -47,10 +49,6 @@ class FakeAdapters:
         await self._call("shutdown", machine_id)
         self.reachable[machine_id] = False
         return CommandResult(0, "", "")
-
-    async def deployment_status(self, deployment_id: str) -> str:
-        await self._call("deployment_status", deployment_id)
-        return self.states.get(deployment_id, "stopped")
 
     async def ready(self, deployment_id: str) -> None:
         await self._call("ready", deployment_id)

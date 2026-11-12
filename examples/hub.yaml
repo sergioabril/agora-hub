@@ -22,7 +22,6 @@ schedule:
 
 timeouts:
   ssh_connect_seconds: 10
-  status_command_seconds: 10
   http_seconds: 10
   machine_boot_seconds: 180
   machine_shutdown_seconds: 120
