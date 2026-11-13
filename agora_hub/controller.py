@@ -143,11 +143,11 @@ class Controller:
 
     async def _observe_deployment(self, deployment_id: str) -> dict:
         try:
-            await self.adapters.ready(deployment_id)
+            models = await self.adapters.ready(deployment_id)
             ready, error = True, None
         except AdapterError as caught:
-            ready, error = False, self._error(caught)
-        observation = {"ready": ready, "error": error, "checked_at": _now()}
+            models, ready, error = [], False, self._error(caught)
+        observation = {"ready": ready, "models": models, "error": error, "checked_at": _now()}
         self.deployment_observations[deployment_id] = observation
         return observation
 
@@ -272,7 +272,7 @@ class Controller:
         status = await self._script(deployment_id, deployment.start_command, max(deadline - loop.time(), 0))
         if status:
             raise RuntimeError(f"start command exited {status}")
-        self._log(deployment_id, "hub", f"waiting for {deployment.endpoint}")
+        self._log(deployment_id, "hub", f"waiting for {deployment.models_url}")
         while True:
             observation = await self._observe_deployment(deployment_id)
             if observation["ready"]:

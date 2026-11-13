@@ -101,6 +101,7 @@ async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     assert secret not in body and "test-ha-token" not in body and "REPLACE_LOCALLY" not in body
     deployment = deployments.json()["deployments"]["pro"]
     assert set(("observed_state", "ready", "endpoint", "error", "operation")) <= set(deployment)
+    assert deployment["models"] == []
     assert deployment["machines"] == ["spark-1", "spark-2", "spark-3", "spark-4"]
     assert deployment["head"] == "spark-1"
     assert not [call for call in adapters.calls if call[0] in {"wake", "shutdown", "stream"}]
@@ -151,9 +152,11 @@ async def test_start_streams_ndjson_and_output_replays(api):
 async def test_machine_off_dependency_conflict_has_remote_state(api):
     _, adapters, _, app, headers = api
     adapters.readiness["pro"] = True
+    adapters.models["pro"] = ["qwen3-235b"]
     async with client(app) as request:
         response = await request.post("/admin/machines/spark-1", json={"action": "off"}, headers=headers)
         status = await request.get("/admin/deployments/status", headers=headers)
+    assert status.json()["deployments"]["pro"]["models"] == ["qwen3-235b"]
     assert response.status_code == 409
     assert response.json()["detail"]["message"] == "machine is running deployment Pro; stop it first"
     assert response.json()["detail"]["blocking"] == {"deployment": "pro"}
@@ -276,7 +279,7 @@ async def test_update_busy_machine_conflicts(api):
 
 
 NEW_DEPLOYMENT = {"name": "Mini", "machines": ["spark-1"], "head": "spark-1", "start_command": "/opt/mini/start.sh --tp 1",
-                  "stop_command": "/opt/mini/stop.sh", "endpoint": "http://spark-1.local:9000/v1/models"}
+                  "stop_command": "/opt/mini/stop.sh", "endpoint": "http://spark-1.local:9000/v1"}
 
 
 async def test_add_and_update_deployment_write_file(api):

@@ -5,4 +5,4 @@ deployments:
     head: spark-1
     start_command: /home/agora/pro/start.sh
     stop_command: /home/agora/pro/stop.sh
-    endpoint: http://spark-1.local:8000/v1/models
+    endpoint: http://spark-1.local:8000/v1

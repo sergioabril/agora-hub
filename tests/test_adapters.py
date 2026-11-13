@@ -121,6 +121,17 @@ async def test_wake_failure_stops_before_turn_on(config, monkeypatch):
     assert paths == ["/api/services/switch/turn_off"]
 
 
+async def test_readiness_gets_models_under_the_endpoint_and_returns_ids(config):
+    urls = []
+
+    def handler(request):
+        urls.append(str(request.url))
+        return httpx.Response(200, json={"object": "list", "data": [{"id": "qwen3-30b"}, {"id": "qwen3-30b-lora"}]})
+
+    assert await make_adapters(config, httpx.MockTransport(handler)).ready("pro") == ["qwen3-30b", "qwen3-30b-lora"]
+    assert urls == ["http://spark-1.local:8000/v1/models"]
+
+
 @pytest.mark.parametrize("status, succeeds", [(204, True), (404, False)])
 async def test_readiness_status(config, status, succeeds):
     transport = httpx.MockTransport(lambda request: httpx.Response(status))

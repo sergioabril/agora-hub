@@ -7,6 +7,7 @@ class FakeAdapters:
     def __init__(self):
         self.reachable: dict[str, bool] = {}
         self.readiness = {}  # deployment_id -> endpoint answers 2xx
+        self.models: dict[str, list[str]] = {}  # deployment_id -> ids /models returns when ready
         self.failures: dict[tuple[str, str], AdapterError] = {}
         self.delays: dict[tuple[str, str], asyncio.Event] = {}
         self.calls: list[tuple] = []
@@ -50,7 +51,8 @@ class FakeAdapters:
         self.reachable[machine_id] = False
         return CommandResult(0, "", "")
 
-    async def ready(self, deployment_id: str) -> None:
+    async def ready(self, deployment_id: str) -> list[str]:
         await self._call("ready", deployment_id)
         if not self.readiness.get(deployment_id, False):
             raise AdapterError("http", "not ready")
+        return self.models.get(deployment_id, [])

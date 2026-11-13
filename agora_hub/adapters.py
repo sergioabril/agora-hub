@@ -45,7 +45,7 @@ class Adapters(Protocol):
 
     async def shutdown(self, machine_id: str) -> CommandResult: ...
 
-    async def ready(self, deployment_id: str) -> None: ...
+    async def ready(self, deployment_id: str) -> list[str]: ...
 
 
 def redact(text: str, config: Config) -> str:
@@ -193,17 +193,22 @@ class RealAdapters:
             )
         return result
 
-    async def ready(self, deployment_id: str) -> None:
+    # GETs the OpenAI `/models` route under the endpoint; any 2xx is ready. Returns the served model ids.
+    async def ready(self, deployment_id: str) -> list[str]:
         deployment = self.config.deployments[deployment_id]
         try:
             async with httpx.AsyncClient(
                 transport=self.transport, timeout=self.config.hub.timeouts.http_seconds
             ) as client:
-                response = await client.get(str(deployment.endpoint))
+                response = await client.get(deployment.models_url)
         except httpx.RequestError as error:
             raise self._error("http", error) from error
         if not response.is_success:
             raise AdapterError("http", f"endpoint returned HTTP {response.status_code}")
+        try:
+            return [str(model["id"]) for model in response.json()["data"]]
+        except (ValueError, KeyError, TypeError):
+            return []
 
     async def wake(self, machine_id: str) -> None:
         try:

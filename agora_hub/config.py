@@ -122,7 +122,11 @@ class DeploymentConfig(Model):
     head: str
     start_command: str
     stop_command: str
-    endpoint: HttpUrl
+    endpoint: HttpUrl  # OpenAI-compatible base URL, usually ending in /v1
+
+    @property
+    def models_url(self) -> str:
+        return str(self.endpoint).rstrip("/") + "/models"
 
     @field_validator("start_command", "stop_command")
     @classmethod
