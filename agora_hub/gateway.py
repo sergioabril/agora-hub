@@ -33,18 +33,21 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
         ):
             raise GatewayError(401, "invalid_api_key", "invalid gateway key")
 
-    def resolve(model: str) -> tuple[str, str]:
-        serving = controller.serving("llm")
-        if not serving:
+    def listed(kinds: tuple[str, ...]) -> list[tuple[str, list[str]]]:
+        return [entry for kind in kinds for entry in controller.serving(kind)]
+
+    def resolve(model: str, kinds: tuple[str, ...]) -> tuple[str, str]:
+        llms = controller.serving("llm")
+        if model == "agora" and llms:
+            return llms[0][0], llms[0][1][0]
+        matches = {key for key, models in listed(kinds) if model != "agora" and model in models}
+        if matches:
+            return next(key for key in config.deployments if key in matches), model
+        if not llms:
             if name := controller.starting("llm"):
                 raise GatewayError(503, "no_llm_running", f"llm deployment {name} is starting", {"Retry-After": "30"})
             raise GatewayError(503, "no_llm_running", "no llm deployment is running")
-        if model == "agora":
-            return serving[0][0], serving[0][1][0]
-        for deployment_id, models in serving:
-            if model in models:
-                return deployment_id, model
-        ids = ", ".join(model_id for _, models in serving for model_id in models)
+        ids = ", ".join(model_id for _, models in listed(kinds) for model_id in models)
         raise GatewayError(404, "model_not_found", f"model {model} is not served; use agora or one of: {ids}")
 
     def image_target() -> tuple[str, str] | None:
@@ -76,17 +79,18 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
 
     @router.get("/proxy/v1/models")
     @router.get("/agent/v1/models")
-    async def models():
-        serving = controller.serving("llm")
-        data = [{"id": "agora", "object": "model", "created": 0, "owned_by": "agora"}] if serving else []
-        for deployment_id, ids in serving:
+    async def models(request: Request):
+        kinds = ("llm", "image") if request.url.path.startswith("/proxy/") else ("llm",)
+        agora = {"id": "agora", "object": "model", "created": 0, "owned_by": "agora"}
+        data = [agora] if controller.serving("llm") else []
+        for deployment_id, ids in listed(kinds):
             data += [{"id": model_id, "object": "model", "created": 0, "owned_by": deployment_id} for model_id in ids]
         return {"object": "list", "data": data}
 
     @router.post("/proxy/v1/{path:path}")
     async def proxy(path: str, request: Request):
         raw, body = await parse(request)
-        deployment_id, model = resolve(body["model"])
+        deployment_id, model = resolve(body["model"], ("llm", "image"))
         if body["model"] == "agora":
             raw = json.dumps({**body, "model": model}).encode()
         deployment = config.deployments[deployment_id]
@@ -114,7 +118,7 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
     @router.post("/agent/v1/chat/completions")
     async def agent(request: Request):
         _, body = await parse(request)
-        deployment_id, body["model"] = resolve(body["model"])
+        deployment_id, body["model"] = resolve(body["model"], ("llm",))
         deployment, gateway = config.deployments[deployment_id], config.hub.gateway
         base_url = f"http://{gateway.public_host}:{gateway.port}/" if gateway.public_host else str(request.base_url)
         try:

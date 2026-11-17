@@ -95,13 +95,16 @@ async def test_auth_and_models(gateway):
         wrong = await request.get("/proxy/v1/models", headers={"Authorization": "Bearer " + "a" * 64})
         missing = await request.post("/proxy/v1/chat/completions", json={"model": "agora"})
         listed = await request.get("/agent/v1/models", headers=KEY)
+        proxied = await request.get("/proxy/v1/models", headers=KEY)
         config.hub.gateway.api_keys = []
         open_ = await request.get("/proxy/v1/models")
     assert empty.json() == {"object": "list", "data": []}
     assert wrong.status_code == missing.status_code == 401
     assert wrong.json() == {"error": {"message": "invalid gateway key", "type": "invalid_request_error", "code": "invalid_api_key"}}
     assert [(m["id"], m["owned_by"]) for m in listed.json()["data"]] == [("agora", "agora"), ("m1", "pro"), ("m2", "pro")]
-    assert open_.status_code == 200 and open_.json() == listed.json()
+    assert [m["id"] for m in proxied.json()["data"]] == ["agora", "m1", "m2", "img"]
+    assert proxied.json()["data"][-1]["owned_by"] == "images"
+    assert open_.status_code == 200 and open_.json() == proxied.json()
 
 
 async def test_proxy_routing(gateway):
@@ -112,12 +115,15 @@ async def test_proxy_routing(gateway):
     )
     async with client(app) as request:
         down = await request.post("/proxy/v1/chat/completions", json={"model": "agora"}, headers=KEY)
-        adapters.readiness.update(pro=True, fast=True)
-        adapters.models.update(pro=["m1", "m2"], fast=["f1"])
+        adapters.readiness.update(pro=True, fast=True, images=True)
+        adapters.models.update(pro=["m1", "m2"], fast=["f1"], images=["img"])
         await controller.deployments_status()
         agora = await request.post("/proxy/v1/chat/completions?x=1", json={"model": "agora", "a": 1}, headers=KEY)
         raw = b'{"model":  "f1", "tools": [{"type": "function"}], "messages": [{"role": "user", "content": "hi"}]}'
         exact = await request.post("/proxy/v1/embeddings", content=raw, headers={**KEY, "X-Extra": "y"})
+        image_raw = b'{"model":"img",  "prompt": "fox"}'
+        image = await request.post("/proxy/v1/images/generations", content=image_raw, headers=KEY)
+        agent_image = await request.post("/agent/v1/chat/completions", content=image_raw, headers=KEY)
         unknown = await request.post("/proxy/v1/chat/completions", json={"model": "nope"}, headers=KEY)
         bad = await request.post("/proxy/v1/chat/completions", content=b"[]", headers=KEY)
         stream = await request.post("/proxy/v1/chat/completions", json={"model": "m2", "stream": True}, headers=KEY)
@@ -127,16 +133,19 @@ async def test_proxy_routing(gateway):
     assert json.loads(requests[0].content) == {"model": "m1", "a": 1}
     assert str(requests[1].url) == "http://fast.local:9000/v1/embeddings"
     assert requests[1].content == raw and requests[1].headers["x-extra"] == "y"
+    assert image.status_code == 200 and str(requests[2].url) == "http://spark-4.local:8001/v1/images/generations"
+    assert requests[2].content == image_raw
+    assert agent_image.status_code == 404 and agent_image.json()["error"]["code"] == "model_not_found"
     assert unknown.status_code == 404
     assert unknown.json()["error"] == {
-        "message": "model nope is not served; use agora or one of: m1, m2, f1",
+        "message": "model nope is not served; use agora or one of: m1, m2, f1, img",
         "type": "invalid_request_error",
         "code": "model_not_found",
     }
     assert bad.status_code == 400 and bad.json()["error"]["code"] == "invalid_request"
     assert stream.content == SSE and stream.headers["x-accel-buffering"] == "no"
     assert stream.headers["cache-control"] == "no-cache"
-    assert len(requests) == 3 and all("authorization" not in r.headers for r in requests)
+    assert len(requests) == 4 and all("authorization" not in r.headers for r in requests)
 
 
 async def test_agent_generate(gateway):

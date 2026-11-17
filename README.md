@@ -2,7 +2,7 @@
 
 ## 1. Intro
 
-Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule. The hub also serves an OpenAI-compatible gateway on `:8888`: `/proxy/v1` passes through to the running LLM, and `/agent/v1` adds image tools backed by image deployments.
+Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule. The hub also serves an OpenAI-compatible gateway on `:8888`: `/proxy/v1` passes through to running deployments by model id, and `/agent/v1` adds image tools backed by image deployments.
 
 ## 2. Quick install
 
@@ -120,7 +120,7 @@ deployments:
     endpoint: http://spark-4.local:8001/v1
 ```
 
-`kind` is required: `llm` deployments are served through the gateway; `image` deployments must speak the OpenAI Images API (`/images/generations` and `/images/edits` with `b64_json`), list at least one model at `/models`, and are only used as `/agent/v1` tools.
+`kind` is required: `llm` deployments are served through the gateway; `image` deployments must speak the OpenAI Images API (`/images/generations` and `/images/edits` with `b64_json`), list at least one model at `/models`, are served on `/proxy/v1` by their model ids (JSON requests such as `/images/generations`), and back the `/agent/v1` tools.
 
 Each key is the deployment id (hub-generated for deployments added through the API; `add` is reserved). `start_command` and `stop_command` start with an absolute path and may take arguments (`/home/agora/pro/start.sh --tp 4`). They run on `head` from the SSH user's home with no `cd` (a script that needs its own folder does `cd "$(dirname "$0")"`), with stdin closed. The start script must exit after launching the model; after it exits 0, the hub waits for `<endpoint>/models` to answer 2xx within `deployment_start_seconds`. `endpoint` is the OpenAI-compatible base URL that agents use, usually ending in `/v1` (`http://spark-1.local:8000/v1`, not `…/v1/models`). The hub probes `<endpoint>/models` for status: any 2xx means the deployment is up, and the `id` of each entry in the response's `data` list is a model the deployment serves.
 
@@ -193,19 +193,19 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 
 The gateway speaks the OpenAI API. When `gateway.api_keys` is set, its `/proxy/v1` and `/agent/v1` routes require `Authorization: Bearer <gateway key>` and answer `401 invalid_api_key` otherwise; the admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
 
-`model: "agora"` goes to the first running LLM deployment (in `deployments.yaml` order) and its first served model id. It's the model-agnostic choice for small tools that don't care which model answers. Any other `model` must exactly match a model id a running LLM serves, or the request fails with `404 model_not_found`. With no LLM running, every request gets `503`.
+`model: "agora"` goes to the first running LLM deployment (in `deployments.yaml` order) and its first served model id. It's the model-agnostic choice for small tools that don't care which model answers. Any other `model` must exactly match a model id a running deployment serves: an LLM or image deployment on `/proxy/v1`, an LLM on `/agent/v1`. Otherwise the request fails with `404 model_not_found`, or `503` while no LLM is running. `agora` never reaches an image deployment.
 
 | Method and path | What it does |
 | --- | --- |
-| `GET /proxy/v1/models`, `GET /agent/v1/models` | `{"object": "list", "data": [...]}`: `agora` first, then every model id a running LLM serves (`owned_by` is its deployment id); `[]` when no LLM runs. |
-| `POST /proxy/v1/{path}` | Passes the request through to `<endpoint>/{path}` of the deployment serving `model`, and streams the response back with its status. `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting), `404 model_not_found`, `400 invalid_request`, or `502 upstream_unavailable` when the deployment can't be reached. |
+| `GET /proxy/v1/models`, `GET /agent/v1/models` | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM serves (`owned_by` is its deployment id); `/proxy/v1/models` then lists every id a running image deployment serves the same way, `/agent/v1/models` doesn't. `[]` when nothing runs. |
+| `POST /proxy/v1/{path}` | Passes the request through to `<endpoint>/{path}` of the deployment serving `model`, and streams the response back with its status. `503 no_llm_running` when no LLM runs and `model` is `agora` or no running image deployment serves it (with `Retry-After: 30` while an LLM is starting), `404 model_not_found`, `400 invalid_request` (multipart bodies such as `/images/edits` included), or `502 upstream_unavailable` when the deployment can't be reached. |
 | `POST /agent/v1/chat/completions` | The same chat API through the hub's harness, with image tools when an image deployment runs (below). Same errors, plus `400 invalid_request` when `n` isn't 1. |
 | `GET /agent/files/{name}` | No auth. An image the harness stored or generated, cached as immutable; `404 file_not_found` otherwise. |
 
 `/agent/v1` runs the tool loop in the hub. Every image in the conversation becomes a text label (`[image_1]`, `[image_2]`, … in order; uploads and the hub's own image links in earlier replies alike), so no image parts are ever sent to the LLM. When an image deployment is running, the request also offers `generate_image` and `edit_image` (edit takes a label) plus a short system note. The hub runs those calls itself, shows a progress line and then the image in the reply, and keeps calling the model until it answers (a 10-call backstop forces an answer). Calls to the client's own tools go back to the client as usual, with the hub's calls already run.
 
 - Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub uses it for image links and reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
-- `/proxy/v1` accepts JSON bodies that name a `model` (`chat/completions`, `completions`, `embeddings`, `responses`, …; multipart and model-less bodies get `400`). It forwards every header except the gateway key and changes nothing but `agora`, which it replaces with the real model id.
+- `/proxy/v1` accepts JSON bodies that name a `model` (`chat/completions`, `completions`, `embeddings`, `responses`, `images/generations`, …; multipart and model-less bodies get `400`). It forwards every header except the gateway key and changes nothing but `agora`, which it replaces with the real model id.
 - `files/` (in the config folder) holds the `/agent/v1` images: content-addressed (a file's name is its hash), never cleaned up, and served without auth. Image links use the public host (or, without one, the host the client called).
 
 ```sh
