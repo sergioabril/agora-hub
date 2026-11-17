@@ -34,15 +34,16 @@ def create_app(config: Config, controller: Controller, home_assistant: HomeAssis
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        schedule_task = asyncio.create_task(run_schedule(config, controller))
+        tasks = [asyncio.create_task(run_schedule(config, controller)), asyncio.create_task(controller.watch())]
         try:
             yield
         finally:
-            schedule_task.cancel()
-            try:
-                await schedule_task
-            except asyncio.CancelledError:
-                pass
+            for task in tasks:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             await controller.close()
 
     app = FastAPI(

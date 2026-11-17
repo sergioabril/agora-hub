@@ -39,6 +39,19 @@ class APIConfig(Model):
         return value
 
 
+class GatewayConfig(Model):
+    port: int = Field(default=8888, ge=1, le=65535)
+    api_keys: list[SecretStr] = Field(default=[], repr=False)
+    public_host: HostName | None = None
+
+    @field_validator("api_keys")
+    @classmethod
+    def hex_keys(cls, value: list[SecretStr]) -> list[SecretStr]:
+        if any(not re.fullmatch(r"[0-9a-fA-F]{64}", key.get_secret_value()) for key in value):
+            raise ValueError("each key must contain 64 hex characters")
+        return value
+
+
 class SSHConfig(Model):
     known_hosts_path: Path
 
@@ -61,7 +74,7 @@ class ScheduleConfig(Model):
     wake_at: HubTime
     shutdown_at: HubTime
     machines: list[str]
-    startup_deployment: str | None
+    startup_deployments: list[str]
 
     @field_validator("timezone")
     @classmethod
@@ -87,14 +100,22 @@ class TimeoutsConfig(Model):
     deployment_start_seconds: PositiveFloat
     deployment_stop_seconds: PositiveFloat
     readiness_poll_seconds: PositiveFloat
+    image_seconds: PositiveFloat
 
 
 class HubConfig(Model):
     api: APIConfig
+    gateway: GatewayConfig
     ssh: SSHConfig
     home_assistant: HomeAssistantConfig
     schedule: ScheduleConfig
     timeouts: TimeoutsConfig
+
+    @model_validator(mode="after")
+    def distinct_ports(self):
+        if self.gateway.port == self.api.port:
+            raise ValueError("gateway.port and api.port must differ")
+        return self
 
 
 class MachineConfig(Model):
@@ -118,6 +139,7 @@ class MachineConfig(Model):
 
 class DeploymentConfig(Model):
     name: Name
+    kind: Literal["llm", "image"]
     machines: list[str]
     head: str
     start_command: str
@@ -142,17 +164,17 @@ def check_deployments(
 ) -> None:
     if "add" in deployments:
         raise ValueError("deployment id add is reserved")
-    if schedule.startup_deployment not in set(deployments) | {None}:
-        raise ValueError(f"unknown schedule deployment: {schedule.startup_deployment}")
+    for startup_id in schedule.startup_deployments:
+        if startup_id not in deployments:
+            raise ValueError(f"unknown schedule deployment: {startup_id}")
     for deployment_id, deployment in deployments.items():
         if unknown := set(deployment.machines) - machine_ids:
             raise ValueError(f"unknown machine in {deployment_id}: {sorted(unknown)[0]}")
         if deployment.head not in deployment.machines:
             raise ValueError(f"head is not in machines for {deployment_id}")
-    if schedule.startup_deployment:
-        startup = deployments[schedule.startup_deployment]
-        if not set(startup.machines) <= set(schedule.machines):
-            raise ValueError("startup_deployment machines must be schedule machines")
+    for startup_id in schedule.startup_deployments:
+        if not set(deployments[startup_id].machines) <= set(schedule.machines):
+            raise ValueError(f"startup deployment {startup_id} machines must be schedule machines")
 
 
 class Config(Model):

@@ -122,8 +122,8 @@ async def test_disabled_schedule_only_reads_status(config):
 
 
 @pytest.mark.asyncio
-async def test_null_startup_deployment_only_wakes_machines(config):
-    config.hub.schedule.startup_deployment = None
+async def test_empty_startup_deployments_only_wakes_machines(config):
+    config.hub.schedule.startup_deployments = []
     adapters = FakeAdapters()
     controller = Controller(config, adapters)
 
@@ -135,6 +135,20 @@ async def test_null_startup_deployment_only_wakes_machines(config):
     await controller.task
     assert {call[1] for call in adapters.calls if call[0] == "wake"} == set(config.hub.schedule.machines)
     assert not [call for call in adapters.calls if call[0] == "stream"]
+
+
+@pytest.mark.asyncio
+async def test_wake_starts_startup_deployments_in_order(config):
+    adapters = FakeAdapters()
+    adapters.failures[("stream", "spark-1")] = AdapterError("command", "pro failed")
+    hook = lambda: adapters.readiness.update(images=True)  # noqa: E731
+    adapters.run_hooks[("spark-4", config.deployments["images"].start_command)] = hook
+    controller = Controller(config, adapters)
+    await controller.schedule_wake()
+    await controller.task
+    assert [call[1] for call in adapters.calls if call[0] == "stream"] == ["spark-1", "spark-4"]
+    operations = controller.deployment_operations
+    assert operations["pro"].status == "failed" and operations["images"].status == "succeeded"
 
 
 @pytest.mark.parametrize(

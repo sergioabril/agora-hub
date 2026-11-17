@@ -13,6 +13,7 @@ def config_dir(tmp_path: Path) -> Path:
     hub = yaml.safe_load((examples / "hub.yaml").read_text())
     hub["api"]["admin_token"] = "a" * 64
     hub["home_assistant"]["token"] = "test-ha-token"
+    hub["gateway"]["api_keys"] = ["b" * 64]
     (tmp_path / "hub.yaml").write_text(yaml.safe_dump(hub))
     (tmp_path / "known_hosts").write_text("")
     return tmp_path

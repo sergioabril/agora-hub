@@ -193,6 +193,7 @@ class Controller:
             deployment = self.config.deployments[key]
             deployments[key] = {
                 "name": deployment.name,
+                "kind": deployment.kind,
                 "machines": list(deployment.machines),
                 "head": deployment.head,
                 "start_command": deployment.start_command,
@@ -202,7 +203,38 @@ class Controller:
                 **self.deployment_observations[key],
                 "operation": self._operation(self.deployment_operations.get(key)),
             }
-        return {"deployments": deployments, "active": self.active}
+        gateway = self.config.hub.gateway
+        llm, image = self.serving("llm"), self.serving("image")
+        targets = {"agora": llm[0][0] if llm else None, "image": image[0][0] if image else None}
+        return {
+            "deployments": deployments,
+            "active": self.active,
+            "gateway": {"host": gateway.public_host, "port": gateway.port, **targets},
+        }
+
+    def serving(self, kind: str) -> list[tuple[str, list[str]]]:
+        result = []
+        for key, deployment in self.config.deployments.items():
+            observation = self.deployment_observations.get(key)
+            if deployment.kind == kind and observation and observation["ready"] and observation["models"]:
+                if not self._in_progress(key):
+                    result.append((key, observation["models"]))
+        return result
+
+    def starting(self, kind: str) -> str | None:
+        for key, deployment in self.config.deployments.items():
+            operation = self._in_progress(key)
+            if deployment.kind == kind and operation and operation.action == "start":
+                return deployment.name
+        return None
+
+    async def watch(self) -> None:
+        while True:
+            try:
+                await self.deployments_status()
+            except Exception:
+                log.exception("deployment watch failed")
+            await asyncio.sleep(self.config.hub.timeouts.readiness_poll_seconds)
 
     async def _poll_machine(self, machine_id: str, reachable: bool, timeout: float) -> None:
         loop = asyncio.get_running_loop()
@@ -352,13 +384,11 @@ class Controller:
 
         async def work():
             await asyncio.gather(*(self._wake(machine_id) for machine_id in schedule.machines))
-            deployment_id = schedule.startup_deployment
-            if not deployment_id:
-                return
-            if (await self._observe_deployment(deployment_id))["ready"]:
-                return
-            operation = self._begin(deployment_id, "start")
-            await self._run_operation(operation, self._start(deployment_id, wake=False))
+            for deployment_id in schedule.startup_deployments:
+                if (await self._observe_deployment(deployment_id))["ready"]:
+                    continue
+                operation = self._begin(deployment_id, "start")
+                await self._run_operation(operation, self._start(deployment_id, wake=False))
 
         self._launch(work())
 

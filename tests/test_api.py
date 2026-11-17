@@ -103,7 +103,8 @@ async def test_partial_status_redacts_secrets_and_reads_do_not_mutate(api):
     assert set(("observed_state", "ready", "endpoint", "error", "operation")) <= set(deployment)
     assert deployment["models"] == []
     assert deployment["machines"] == ["spark-1", "spark-2", "spark-3", "spark-4"]
-    assert deployment["head"] == "spark-1"
+    assert deployment["head"] == "spark-1" and deployment["kind"] == "llm"
+    assert deployments.json()["gateway"] == {"host": None, "port": 8888, "agora": None, "image": None}
     assert not [call for call in adapters.calls if call[0] in {"wake", "shutdown", "stream"}]
     await controller.close()
 
@@ -278,7 +279,7 @@ async def test_update_busy_machine_conflicts(api):
     assert busy.status_code == 409 and busy.json()["detail"]["code"] == "machine_busy"
 
 
-NEW_DEPLOYMENT = {"name": "Mini", "machines": ["spark-1"], "head": "spark-1", "start_command": "/opt/mini/start.sh --tp 1",
+NEW_DEPLOYMENT = {"name": "Mini", "kind": "llm", "machines": ["spark-1"], "head": "spark-1", "start_command": "/opt/mini/start.sh --tp 1",
                   "stop_command": "/opt/mini/stop.sh", "endpoint": "http://spark-1.local:9000/v1"}
 
 

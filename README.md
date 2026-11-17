@@ -2,7 +2,7 @@
 
 ## 1. Intro
 
-Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule.
+Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule. The hub also serves an OpenAI-compatible gateway on `:8888`: `/proxy/v1` passes through to the running LLM, and `/agent/v1` adds image tools backed by image deployments.
 
 ## 2. Quick install
 
@@ -33,9 +33,9 @@ make deploy
 - `deployments.yaml`: `deployments: {}`
 - `known_hosts`: empty
 
-It then builds the image and starts the hub in the background on port `3333`, with the config folder mounted writable so the add and update endpoints can save machines and deployments. The container uses `--restart unless-stopped`, so it comes back after a crash, a Docker restart or a reboot (on macOS, enable Docker Desktop's "Start when you sign in"). Run `make deploy` again to rebuild and replace it; nothing in the config folder is overwritten. Use `make deploy CONFIG_DIR=/other/path` for a different folder.
+It then builds the image and starts the hub in the background, publishing port `3333` (admin API) and port `8888` (gateway), with the config folder mounted writable so the add and update endpoints can save machines and deployments. The container uses `--restart unless-stopped`, so it comes back after a crash, a Docker restart or a reboot (on macOS, enable Docker Desktop's "Start when you sign in"). Run `make deploy` again to rebuild and replace it; nothing in the config folder is overwritten. Use `make deploy CONFIG_DIR=/other/path` for a different folder.
 
-> **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`).
+> **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`). `gateway.api_keys` also starts empty, so the gateway on port `8888` is open too: anyone who can reach it can use the running models. Set gateway keys (§3) before sharing the network.
 
 After the first deploy, set Home Assistant's `host`, `port` and long-lived access `token` through `POST /admin/integrations/homeassistant`, then add machines through `POST /admin/machines/add`, then deployments through `POST /admin/deployments/add` (see §4). After editing a YAML file by hand, run `docker restart agora-hub`.
 
@@ -53,6 +53,9 @@ Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
 
 ```yaml
 api: {host: 127.0.0.1, port: 3333, admin_token: ""}
+gateway:
+  port: 8888
+  api_keys: [] # empty = NO authentication; otherwise each key is 64 hex chars (openssl rand -hex 32)
 ssh: {known_hosts_path: known_hosts}
 home_assistant:
   host: homeassistant.local
@@ -64,8 +67,8 @@ schedule:
   timezone: Europe/Madrid
   wake_at: "08:00"
   shutdown_at: "23:00"
-  machines: [spark-1]
-  startup_deployment: pro
+  machines: [spark-1, spark-2, spark-3, spark-4]
+  startup_deployments: [pro, images] # started in this order after the machines wake; [] = none
 timeouts:
   ssh_connect_seconds: 10
   http_seconds: 10
@@ -74,7 +77,10 @@ timeouts:
   deployment_start_seconds: 900
   deployment_stop_seconds: 60
   readiness_poll_seconds: 5
+  image_seconds: 300
 ```
+
+Gateway keys: `gateway.api_keys` is a list; empty means the gateway on `gateway.port` accepts every request, otherwise each key is 64 hex characters (`openssl rand -hex 32`) and clients send one as `Authorization: Bearer <key>`. Gateway keys are independent of the admin token: neither works in place of the other. Edit the list in `hub.yaml`, then run `docker restart agora-hub`. `gateway.port` must differ from `api.port`. `timeouts.image_seconds` bounds one image generation or edit.
 
 The hub calls Home Assistant at plain `http://<host>:<port>` (`host` is an IP or hostname, without scheme). An empty `token` means Home Assistant is not configured: the switch endpoints answer `409` and waking a machine fails.
 
@@ -98,12 +104,23 @@ machines:
 deployments:
   pro:
     name: Pro
+    kind: llm
     machines: [spark-1, spark-2, spark-3, spark-4]
     head: spark-1
     start_command: /home/agora/pro/start.sh
     stop_command: /home/agora/pro/stop.sh
     endpoint: http://spark-1.local:8000/v1
+  images:
+    name: Images
+    kind: image
+    machines: [spark-4]
+    head: spark-4
+    start_command: /home/agora/images/start.sh
+    stop_command: /home/agora/images/stop.sh
+    endpoint: http://spark-4.local:8001/v1
 ```
+
+`kind` is required: `llm` deployments are served through the gateway; `image` deployments must speak the OpenAI Images API (`/images/generations` and `/images/edits` with `b64_json`), list at least one model at `/models`, and are only used as `/agent/v1` tools.
 
 Each key is the deployment id (hub-generated for deployments added through the API; `add` is reserved). `start_command` and `stop_command` start with an absolute path and may take arguments (`/home/agora/pro/start.sh --tp 4`). They run on `head` from the SSH user's home with no `cd` (a script that needs its own folder does `cd "$(dirname "$0")"`), with stdin closed. The start script must exit after launching the model; after it exits 0, the hub waits for `<endpoint>/models` to answer 2xx within `deployment_start_seconds`. `endpoint` is the OpenAI-compatible base URL that agents use, usually ending in `/v1` (`http://spark-1.local:8000/v1`, not `…/v1/models`). The hub probes `<endpoint>/models` for status: any 2xx means the deployment is up, and the `id` of each entry in the response's `data` list is a model the deployment serves.
 
@@ -130,8 +147,8 @@ When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <a
 | `POST /admin/machines/test` | Machine fields, as for add | Validates them like add, then tries an SSH login without saving the machine; returns `200` with `{"reachable", "error"}` (`error` is `null` when the login works, otherwise `auth: ...`, `host_key: ...` or `connect: ...`), or `422`. Like any first connection, it saves a new host's key to `known_hosts`. |
 | `POST /admin/machines/{machine_id}/update` | Any subset of machine fields; `null` resets one to its default | Updates a machine; returns `200`, `404`, `409` (`machine_busy`), or `422`. |
 | `POST /admin/machines/{machine_id}` | `{"action":"on"}` or `{"action":"off"}` | Starts an independent machine action; returns `202`, or `409` when blocked. `{"action":"off"}` answers `409 deployment_active` while the machine runs, starts or stops a deployment. |
-| `GET /admin/deployments/status` | None | Probes each `<endpoint>/models` without mutations and returns the deployment fields (`name`, `machines`, `head`, `start_command`, `stop_command`, `endpoint`), `observed_state` (`starting`/`stopping` while an operation runs, otherwise `running` when the probe answers 2xx, else `stopped`), `ready`, `models` (the served model ids from the probe; empty when not ready), `error`, `checked_at` and `operation`. |
-| `POST /admin/deployments/add` | All six deployment fields (`name`, `machines`, `head`, `start_command`, `stop_command`, `endpoint`) | Adds a deployment with a hub-generated 8-hex id; returns `201` with the deployment (`id` plus the six fields), `422`, or `500`. |
+| `GET /admin/deployments/status` | None | Probes each `<endpoint>/models` without mutations and returns the deployment fields (`name`, `kind`, `machines`, `head`, `start_command`, `stop_command`, `endpoint`), `observed_state` (`starting`/`stopping` while an operation runs, otherwise `running` when the probe answers 2xx, else `stopped`), `ready`, `models` (the served model ids from the probe; empty when not ready), `error`, `checked_at` and `operation`. The top-level `gateway` is `{"host", "port", "agora", "image"}`: the public host (or `null`), the gateway port, and the ids of the deployments that `model: "agora"` and the image tools currently go to (or `null`). |
+| `POST /admin/deployments/add` | All seven deployment fields (`name`, `kind`, `machines`, `head`, `start_command`, `stop_command`, `endpoint`) | Adds a deployment with a hub-generated 8-hex id; returns `201` with the deployment (`id` plus the seven fields), `422`, or `500`. |
 | `POST /admin/deployments/{deployment_id}/update` | Any subset of deployment fields; `null` drops one, which is a `422` since all are required | Updates a deployment; returns `200` with the deployment, `404`, `409` (`deployment_busy` while it has an active operation), `422`, or `500`. |
 | `POST /admin/deployments/{deployment_id}` | `{"action":"start"}` or `{"action":"stop"}` | Starts the deployment's start or stop script on `head`; returns `202` with the operation's live NDJSON stream (below), or `404`, `409` (`busy`, `deployment_active`), or `422` as JSON. Closing the stream doesn't affect the operation. |
 | `GET /admin/deployments/{deployment_id}/output` | None | Returns `200` with the NDJSON stream of the deployment's current or last operation (a finished one replays its log and ends at once), `404 Deployment not found`, or `404 No operation` when it has had none since the hub started. |
@@ -158,7 +175,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
   -d '{"host":"10.0.0.5"}' http://localhost:3333/admin/machines/spark-1/update
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/status
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"Pro","machines":["spark-1","spark-2"],"head":"spark-1","start_command":"/home/agora/pro/start.sh","stop_command":"/home/agora/pro/stop.sh","endpoint":"http://spark-1.local:8000/v1"}' \
+  -d '{"name":"Pro","kind":"llm","machines":["spark-1","spark-2"],"head":"spark-1","start_command":"/home/agora/pro/start.sh","stop_command":"/home/agora/pro/stop.sh","endpoint":"http://spark-1.local:8000/v1"}' \
   http://localhost:3333/admin/deployments/add
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"start_command":"/home/agora/pro/start.sh --tp 2"}' http://localhost:3333/admin/deployments/pro/update
@@ -170,4 +187,32 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/integrations/homeassistant/switches
 curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '[{"entity_id":"switch.lamp","state":"on"}]' http://localhost:3333/admin/integrations/homeassistant/switches
+```
+
+### Gateway (port 8888)
+
+The gateway speaks the OpenAI API. When `gateway.api_keys` is set, its `/proxy/v1` and `/agent/v1` routes require `Authorization: Bearer <gateway key>` and answer `401 invalid_api_key` otherwise; the admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
+
+`model: "agora"` goes to the first running LLM deployment (in `deployments.yaml` order) and its first served model id. It's the model-agnostic choice for small tools that don't care which model answers. Any other `model` must exactly match a model id a running LLM serves, or the request fails with `404 model_not_found`. With no LLM running, every request gets `503`.
+
+| Method and path | What it does |
+| --- | --- |
+| `GET /proxy/v1/models`, `GET /agent/v1/models` | `{"object": "list", "data": [...]}`: `agora` first, then every model id a running LLM serves (`owned_by` is its deployment id); `[]` when no LLM runs. |
+| `POST /proxy/v1/{path}` | Passes the request through to `<endpoint>/{path}` of the deployment serving `model`, and streams the response back with its status. `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting), `404 model_not_found`, `400 invalid_request`, or `502 upstream_unavailable` when the deployment can't be reached. |
+| `POST /agent/v1/chat/completions` | The same chat API through the hub's harness, with image tools when an image deployment runs (below). Same errors, plus `400 invalid_request` when `n` isn't 1. |
+| `GET /agent/files/{name}` | No auth. An image the harness stored or generated, cached as immutable; `404 file_not_found` otherwise. |
+
+`/agent/v1` runs the tool loop in the hub. Every image in the conversation becomes a text label (`[image_1]`, `[image_2]`, … in order; uploads and the hub's own image links in earlier replies alike), so no image parts are ever sent to the LLM. When an image deployment is running, the request also offers `generate_image` and `edit_image` (edit takes a label) plus a short system note. The hub runs those calls itself, shows a progress line and then the image in the reply, and keeps calling the model until it answers (a 10-call backstop forces an answer). Calls to the client's own tools go back to the client as usual, with the hub's calls already run.
+
+- Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub uses it for image links and reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
+- `/proxy/v1` accepts JSON bodies that name a `model` (`chat/completions`, `completions`, `embeddings`, `responses`, …; multipart and model-less bodies get `400`). It forwards every header except the gateway key and changes nothing but `agora`, which it replaces with the real model id.
+- `files/` (in the config folder) holds the `/agent/v1` images: content-addressed (a file's name is its hash), never cleaned up, and served without auth. Image links use the public host (or, without one, the host the client called).
+
+```sh
+KEY=your-64-character-gateway-key
+curl -H "Authorization: Bearer $KEY" http://localhost:8888/proxy/v1/models
+curl -N -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"agora","stream":true,"messages":[{"role":"user","content":"hi"}]}' http://localhost:8888/proxy/v1/chat/completions
+curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"agora","messages":[{"role":"user","content":"draw a red fox"}]}' http://localhost:8888/agent/v1/chat/completions
 ```

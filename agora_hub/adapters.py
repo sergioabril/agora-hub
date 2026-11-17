@@ -49,7 +49,7 @@ class Adapters(Protocol):
 
 
 def redact(text: str, config: Config) -> str:
-    secrets = [config.hub.api.admin_token, config.hub.home_assistant.token]
+    secrets = [config.hub.api.admin_token, config.hub.home_assistant.token, *config.hub.gateway.api_keys]
     for machine in config.machines.values():
         secrets.extend([machine.password, machine.sudo_password])
     for secret in secrets:
