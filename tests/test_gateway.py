@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -15,6 +16,8 @@ KEY = {"Authorization": "Bearer " + "b" * 64}
 SSE = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
 NAME = hashlib.sha256(PNG).hexdigest()[:32] + ".png"
+PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
+SHOWN = {"type": "text", "text": "Images shown above, attached so you can see them:"}
 GENERATING = "\n\n_generating image…_\n\n"
 LOOKUP = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
 
@@ -77,8 +80,8 @@ def chats(requests):
     return [json.loads(r.content) for r in requests if r.url.path.endswith("/chat/completions")]
 
 
-def agent(request, messages, **body):
-    return request.post("/agent/v1/chat/completions", json={"model": "agora", "messages": messages, **body}, headers=KEY)
+def ask(request, messages, **body):
+    return request.post("/openai/v1/chat/completions", json={"model": "agora", "messages": messages, **body}, headers=KEY)
 
 
 def stream_calls(*calls):
@@ -88,75 +91,77 @@ def stream_calls(*calls):
 async def test_auth_and_models(gateway):
     config, adapters, controller, app, _, _ = gateway
     async with client(app) as request:
-        empty = await request.get("/proxy/v1/models", headers=KEY)
+        empty = await request.get("/openai/v1/models", headers=KEY)
         adapters.readiness.update(pro=True, images=True)
         adapters.models.update(pro=["m1", "m2"], images=["img"])
         await controller.deployments_status()
-        wrong = await request.get("/proxy/v1/models", headers={"Authorization": "Bearer " + "a" * 64})
-        missing = await request.post("/proxy/v1/chat/completions", json={"model": "agora"})
-        listed = await request.get("/agent/v1/models", headers=KEY)
-        proxied = await request.get("/proxy/v1/models", headers=KEY)
+        wrong = await request.get("/openai/v1/models", headers={"Authorization": "Bearer " + "a" * 64})
+        missing = await request.post("/openai/v1/chat/completions", json={"model": "agora"})
+        listed = await request.get("/openai/v1/models", headers=KEY)
+        embeddings = await request.post("/openai/v1/embeddings", json={"model": "agora"}, headers=KEY)
+        get_chat = await request.get("/openai/v1/chat/completions", headers=KEY)
+        old = [await request.get(f"/{prefix}/v1/models", headers=KEY) for prefix in ("proxy", "agent")]  # removed
         config.hub.gateway.api_keys = []
-        open_ = await request.get("/proxy/v1/models")
+        open_ = await request.get("/openai/v1/models")
     assert empty.json() == {"object": "list", "data": []}
     assert wrong.status_code == missing.status_code == 401
     assert wrong.json() == {"error": {"message": "invalid gateway key", "type": "invalid_request_error", "code": "invalid_api_key"}}
     assert [(m["id"], m["owned_by"]) for m in listed.json()["data"]] == [("agora", "agora"), ("m1", "pro"), ("m2", "pro")]
-    assert [m["id"] for m in proxied.json()["data"]] == ["agora", "m1", "m2", "img"]
-    assert proxied.json()["data"][-1]["owned_by"] == "images"
-    assert open_.status_code == 200 and open_.json() == proxied.json()
+    assert [r.status_code for r in (embeddings, get_chat, *old)] == [404] * 4
+    assert embeddings.json()["error"]["code"] == get_chat.json()["error"]["code"] == "not_found"
+    assert embeddings.json()["error"]["message"].startswith("POST /openai/v1/embeddings is not served; the gateway serves GET")
+    assert open_.status_code == 200 and open_.json() == listed.json()
 
 
-async def test_proxy_routing(gateway):
+async def test_routing(gateway):
     config, adapters, controller, app, requests, _ = gateway
-    config.deployments["fast"] = DeploymentConfig(
-        name="Fast", kind="llm", machines=["spark-1"], head="spark-1",
-        start_command="/s", stop_command="/s", endpoint="http://fast.local:9000/v1/",
-    )
+    config.deployments["fast"] = DeploymentConfig(name="Fast", kind="llm", machines=["spark-1"], head="spark-1",
+                                                  start_command="/s", stop_command="/s", endpoint="http://fast.local:9000/v1/")
+    messages = [{"role": "user", "content": "hi"}]
     async with client(app) as request:
-        down = await request.post("/proxy/v1/chat/completions", json={"model": "agora"}, headers=KEY)
+        down = await ask(request, messages)
         adapters.readiness.update(pro=True, fast=True, images=True)
         adapters.models.update(pro=["m1", "m2"], fast=["f1"], images=["img"])
         await controller.deployments_status()
-        agora = await request.post("/proxy/v1/chat/completions?x=1", json={"model": "agora", "a": 1}, headers=KEY)
-        raw = b'{"model":  "f1", "tools": [{"type": "function"}], "messages": [{"role": "user", "content": "hi"}]}'
-        exact = await request.post("/proxy/v1/embeddings", content=raw, headers={**KEY, "X-Extra": "y"})
-        image_raw = b'{"model":"img",  "prompt": "fox"}'
-        image = await request.post("/proxy/v1/images/generations", content=image_raw, headers=KEY)
-        agent_image = await request.post("/agent/v1/chat/completions", content=image_raw, headers=KEY)
-        unknown = await request.post("/proxy/v1/chat/completions", json={"model": "nope"}, headers=KEY)
-        bad = await request.post("/proxy/v1/chat/completions", content=b"[]", headers=KEY)
-        stream = await request.post("/proxy/v1/chat/completions", json={"model": "m2", "stream": True}, headers=KEY)
-    assert down.status_code == 503 and down.json()["error"]["code"] == "no_llm_running"
-    assert agora.status_code == 200 and agora.json() == {"ok": True}
-    assert str(requests[0].url) == "http://spark-1.local:8000/v1/chat/completions?x=1"
-    assert json.loads(requests[0].content) == {"model": "m1", "a": 1}
-    assert str(requests[1].url) == "http://fast.local:9000/v1/embeddings"
-    assert requests[1].content == raw and requests[1].headers["x-extra"] == "y"
-    assert image.status_code == 200 and str(requests[2].url) == "http://spark-4.local:8001/v1/images/generations"
-    assert requests[2].content == image_raw
-    assert agent_image.status_code == 404 and agent_image.json()["error"]["code"] == "model_not_found"
-    assert unknown.status_code == 404
-    assert unknown.json()["error"] == {
-        "message": "model nope is not served; use agora or one of: m1, m2, f1, img",
-        "type": "invalid_request_error",
-        "code": "model_not_found",
-    }
-    assert bad.status_code == 400 and bad.json()["error"]["code"] == "invalid_request"
-    assert stream.content == SSE and stream.headers["x-accel-buffering"] == "no"
-    assert stream.headers["cache-control"] == "no-cache"
-    assert len(requests) == 4 and all("authorization" not in r.headers for r in requests)
+        agora = await ask(request, messages)
+        exact, image, unknown = [await ask(request, messages, model=model) for model in ("f1", "img", "nope")]
+        bad = await request.post("/openai/v1/chat/completions", content=b"[]", headers=KEY)
+    assert agora.json() == exact.json() == {"ok": True}
+    assert [(str(r.url), json.loads(r.content)["model"]) for r in requests] == [
+        ("http://spark-1.local:8000/v1/chat/completions", "m1"), ("http://fast.local:9000/v1/chat/completions", "f1")]
+    assert [(r.status_code, r.json()["error"]["code"]) for r in (down, image, unknown, bad)] == [
+        (503, "no_llm_running"), (404, "model_not_found"), (404, "model_not_found"), (400, "invalid_request")]
+    assert unknown.json()["error"]["message"] == "model nope is not served; use agora or one of: m1, m2, f1"
+    assert all("authorization" not in r.headers for r in requests)
 
 
-async def test_agent_generate(gateway):
+async def test_disconnect(gateway):
+    _, adapters, controller, app, requests, replies = gateway
+    await serve(adapters, controller)
+
+    async def slow():  # MockTransport awaits a coroutine reply
+        await asyncio.sleep(0.5)
+        return completion(calls=[call("generate_image", {"prompt": "fox"})])
+    replies.append(slow())
+    body = json.dumps({"model": "agora", "messages": [{"role": "user", "content": "fox"}]}).encode()
+    received, sent = asyncio.Queue(), asyncio.Queue()
+    for message in ({"type": "http.request", "body": body}, {"type": "http.disconnect"}):
+        received.put_nowait(message)
+    scope = {"type": "http", "method": "POST", "path": "/openai/v1/chat/completions", "query_string": b"",
+             "headers": [(b"authorization", KEY["Authorization"].encode())]}
+    await app(scope, received.get, sent.put)
+    assert sent.get_nowait()["status"] == 499 and len(chats(requests)) == 1 and not any("/images/" in r.url.path for r in requests)
+
+
+async def test_chat_generate(gateway):
     config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
     replies += [completion(calls=[call("generate_image", {"prompt": "a red fox"})]), completion("A fox.")]
     async with client(app) as request:
-        reply = await agent(request, [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "fox"}])
-        image = await request.get(f"/agent/files/{NAME}")
-        missing = await request.get("/agent/files/0000.png")
-    url = f"http://test/agent/files/{NAME}"
+        reply = await ask(request, [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "fox"}])
+        image = await request.get(f"/files/{NAME}")
+        missing = await request.get("/files/0000.png")
+    url = f"http://test/files/{NAME}"
     assert reply.json()["choices"][0]["message"]["content"] == f"{GENERATING}![image_1]({url})\n\nA fox."
     assert image.content == PNG and image.headers["content-type"] == "image/png"
     assert image.headers["cache-control"] == "public, max-age=31536000, immutable"
@@ -166,12 +171,15 @@ async def test_agent_generate(gateway):
     first, second = chats(requests)
     assert first["model"] == "m1" and [t["function"]["name"] for t in first["tools"]] == ["generate_image", "edit_image"]
     assert first["messages"][0]["content"].startswith("Be brief.\n\nImages in this conversation are labelled")
-    assert second["messages"][-2]["tool_calls"][0]["id"] == "call_1"
-    assert second["messages"][-1] == {"role": "tool", "tool_call_id": "call_1", "content": "image_1 is shown to the user"}
+    assert second["messages"][-3]["tool_calls"][0]["id"] == "call_1"
+    assert second["messages"][-2] == {"role": "tool", "tool_call_id": "call_1",
+                                      "content": "image_1 is shown to the user and attached below"}
+    assert second["messages"][-1] == {"role": "user", "content": [
+        SHOWN, {"type": "text", "text": "[image_1]"}, {"type": "image_url", "image_url": {"url": PNG_URL}}]}
     assert (config.config_dir / "files" / NAME).stat().st_mode & 0o777 == 0o600
 
 
-async def test_agent_generate_streaming(gateway):
+async def test_chat_generate_streaming(gateway):
     _, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
     replies += [
@@ -180,31 +188,36 @@ async def test_agent_generate_streaming(gateway):
         sse({"content": "Done."}),
     ]
     async with client(app) as request:
-        reply = await agent(request, [{"role": "user", "content": "fox"}], stream=True)
+        reply = await ask(request, [{"role": "user", "content": "fox"}], stream=True)
     assert "tool_calls" not in reply.text and reply.text.endswith("data: [DONE]\n\n")
-    image = f"![image_1](http://test/agent/files/{NAME})\n\n"
+    image = f"![image_1](http://test/files/{NAME})\n\n"
     assert [d.get("content") for d in deltas(reply.text)] == ["Sure.", GENERATING, image, "Done.", None]
-    assert chats(requests)[1]["messages"][-2]["content"] == "Sure."
+    assert chats(requests)[1]["messages"][-3]["content"] == "Sure."
+    assert chats(requests)[1]["messages"][-1]["content"][2] == {"type": "image_url", "image_url": {"url": PNG_URL}}
 
 
-async def test_agent_history_and_edit(gateway):
+async def test_chat_history_and_edit(gateway):
     config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
     other = FileStore(config.config_dir / "files").save(PNG[:8] + b"y" * 16)
-    data_url = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(PNG).decode()}}
+    other_url = "data:image/png;base64," + base64.b64encode(PNG[:8] + b"y" * 16).decode()
+    data_url = {"type": "image_url", "image_url": {"url": PNG_URL}}
     messages = [
         {"role": "user", "content": [{"type": "text", "text": "make it blue"}, data_url]},
-        {"role": "assistant", "content": f"Here ![image_1](http://elsewhere:8888/agent/files/{other})"},
+        {"role": "assistant", "content": f"Here ![image_1](http://elsewhere:8888/files/{other})",
+         "tool_calls": [call("lookup", {}, "call_9")]},
+        {"role": "tool", "tool_call_id": "call_9", "content": "found"},
         {"role": "user", "content": [data_url, {"type": "image_url", "image_url": {"url": "https://x.org/a.png"}}]},
     ]
     replies += [completion(calls=[call("edit_image", {"image": "image_1", "prompt": "blue"})]), completion("Done.")]
     async with client(app) as request:
-        reply = await agent(request, messages)
+        reply = await ask(request, messages)
     first = chats(requests)[0]
-    assert "image_url" not in json.dumps(first)
-    assert first["messages"][1]["content"] == [{"type": "text", "text": "make it blue"}, {"type": "text", "text": "[image_1]"}]
-    assert first["messages"][2]["content"] == "Here [image_2]"
-    assert [p["text"] for p in first["messages"][3]["content"]] == ["[image_1]", "[image unavailable]"]
+    assert first["messages"][1]["content"] == [{"type": "text", "text": "make it blue"}, {"type": "text", "text": "[image_1]"}, data_url]
+    assert first["messages"][2]["content"] == "Here [image_2]" and first["messages"][3]["role"] == "tool"
+    assert first["messages"][4] == {"role": "user", "content": [
+        SHOWN, {"type": "text", "text": "[image_2]"}, {"type": "image_url", "image_url": {"url": other_url}}]}
+    assert first["messages"][5]["content"] == [{"type": "text", "text": "[image_1]"}, {"type": "text", "text": "[image unavailable]"}]
     edit = requests[1]
     assert str(edit.url) == "http://spark-4.local:8001/v1/images/edits"
     assert edit.headers["content-type"].startswith("multipart/form-data")
@@ -212,7 +225,7 @@ async def test_agent_history_and_edit(gateway):
     assert "_editing image_1…_" in reply.json()["choices"][0]["message"]["content"]
 
 
-async def test_agent_client_tools(gateway):
+async def test_chat_client_tools(gateway):
     _, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
     messages = [{"role": "user", "content": "go"}]
@@ -222,27 +235,27 @@ async def test_agent_client_tools(gateway):
         sse(*stream_calls(call("generate_image", {"prompt": "x"}), lookup), finish="tool_calls", joined=True),
     ]
     async with client(app) as request:
-        only = await agent(request, messages, tools=[LOOKUP])
-        mixed = await agent(request, messages, tools=[LOOKUP], stream=True)
+        only = await ask(request, messages, tools=[LOOKUP])
+        mixed = await ask(request, messages, tools=[LOOKUP], stream=True)
         await serve(adapters, controller, image=False)
-        await agent(request, messages, tools=[LOOKUP])
+        await ask(request, messages, tools=[LOOKUP])
     assert only.json()["choices"][0]["message"]["tool_calls"] == [lookup]
     assert [r.url.path for r in requests].count("/v1/images/generations") == 1
     sent = deltas(mixed.text)
     assert [d["tool_calls"] for d in sent if "tool_calls" in d] == [[{"index": 0, **lookup}]]
-    assert f"![image_1](http://test/agent/files/{NAME})\n\n" in [d.get("content") for d in sent]
+    assert f"![image_1](http://test/files/{NAME})\n\n" in [d.get("content") for d in sent]
     assert mixed.text.count('"finish_reason": "tool_calls"') == 1 and len(chats(requests)) == 3
     last = chats(requests)[-1]
     assert last["tools"] == [LOOKUP] and last["messages"] == messages
 
 
-async def test_agent_public_host(gateway):
+async def test_chat_public_host(gateway):
     config, adapters, controller, app, _, replies = gateway
     config.hub.gateway.public_host = "100.64.1.2"
     await serve(adapters, controller)
     replies += [completion(calls=[call("generate_image", {"prompt": "x"})]), completion("ok")]
     async with client(app) as request:
-        reply = await agent(request, [{"role": "user", "content": "fox"}])
+        reply = await ask(request, [{"role": "user", "content": "fox"}])
     content = reply.json()["choices"][0]["message"]["content"]
-    assert f"![image_1](http://100.64.1.2:8888/agent/files/{NAME})" in content
+    assert f"![image_1](http://100.64.1.2:8888/files/{NAME})" in content
     assert (await controller.deployments_status())["gateway"]["host"] == "100.64.1.2"

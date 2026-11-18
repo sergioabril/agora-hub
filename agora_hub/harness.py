@@ -2,7 +2,7 @@ import asyncio
 import base64
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import httpx
@@ -14,6 +14,7 @@ MAX_ROUNDS = 10  # runaway backstop only; a normal reply ends after 1–3 calls
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,(.*)", re.S)
 DONE = "data: [DONE]\n\n"
+SHOWN = "Images shown above, attached so you can see them:"
 
 
 class BadRequest(Exception):
@@ -50,6 +51,7 @@ class Turn:
     hub_tools: list[dict]
     note: str
     round: int = 1  # number of the upstream call being made or read
+    attached: set[str] = field(default_factory=set)  # file names already sent to the model as image parts
 
     def payload(self) -> dict:
         final = self.round == MAX_ROUNDS
@@ -88,8 +90,14 @@ class Harness:
         client_tools = body.get("tools") or []
         taken = {tool.get("function", {}).get("name") for tool in client_tools}
         hub_tools = [tool for tool in self.tools.specs() if tool["function"]["name"] not in taken]
-        messages = [self._message(message, context) for message in body["messages"]]
-        turn = Turn(body, url, context, messages, client_tools, hub_tools, self.tools.instructions())
+        turn = Turn(body, url, context, [], client_tools, hub_tools, self.tools.instructions())
+        found = []  # names first seen as links, shown after the message and the tool messages that follow it
+        for message in body["messages"]:
+            if message.get("role") != "tool":
+                turn.messages += self._shown(found, turn)
+                found = []
+            turn.messages.append(self._message(message, turn, found))
+        turn.messages += self._shown(found, turn)
         stream = bool(body.get("stream"))
         try:
             response = await self._send(turn, stream)
@@ -104,7 +112,18 @@ class Harness:
         headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         return StreamingResponse(self._stream(turn, response), media_type="text/event-stream", headers=headers)
 
-    # Request rewrite: every image becomes an [image_N] label (or [image unavailable]).
+    # Request rewrite: each image reaches the model once, as its [image_N] label plus a data URL part.
+
+    def _attach(self, name: str, turn: Turn) -> list[dict]:
+        parts = [{"type": "text", "text": f"[{turn.context.label(name)}]"}]
+        if name not in turn.attached:
+            turn.attached.add(name)
+            parts.append({"type": "image_url", "image_url": {"url": self.store.data_url(name)}})
+        return parts
+
+    def _shown(self, names: list[str], turn: Turn) -> list[dict]:
+        parts = [part for name in names if name not in turn.attached for part in self._attach(name, turn)]
+        return [{"role": "user", "content": [{"type": "text", "text": SHOWN}, *parts]}] if parts else []
 
     def _file(self, url: str) -> str | None:
         try:
@@ -114,14 +133,16 @@ class Harness:
         name = path[len(FILES_PATH):] if path.startswith(FILES_PATH) else ""
         return name if self.store.path(name) else None
 
-    def _text(self, text: str, context: ToolContext) -> str:
+    def _text(self, text: str, turn: Turn, found: list[str]) -> str:
         def label(match):
-            name = self._file(match[1])
-            return f"[{context.label(name)}]" if name else match[0]
+            if not (name := self._file(match[1])):
+                return match[0]
+            found.append(name)
+            return f"[{turn.context.label(name)}]"
 
         return MARKDOWN_IMAGE.sub(label, text)
 
-    def _image(self, part: dict, context: ToolContext) -> str:
+    def _image(self, part: dict, turn: Turn) -> list[dict]:
         url = (part.get("image_url") or {}).get("url") or ""
         if match := DATA_URL.match(url):
             try:
@@ -130,21 +151,22 @@ class Harness:
                 name = None
         else:
             name = self._file(url)
-        return f"[{context.label(name)}]" if name else "[image unavailable]"
+        return self._attach(name, turn) if name else [{"type": "text", "text": "[image unavailable]"}]
 
-    def _message(self, message: dict, context: ToolContext) -> dict:
+    def _message(self, message: dict, turn: Turn, found: list[str]) -> dict:
         content = message.get("content")
         if isinstance(content, str):
-            return {**message, "content": self._text(content, context)}
+            return {**message, "content": self._text(content, turn, found)}
         if not isinstance(content, list):
             return message
         parts = []
         for part in content:
             if part.get("type") == "image_url":
-                part = {"type": "text", "text": self._image(part, context)}
+                parts += self._image(part, turn)
             elif part.get("type") == "text" and isinstance(part.get("text"), str):
-                part = {**part, "text": self._text(part["text"], context)}
-            parts.append(part)
+                parts.append({**part, "text": self._text(part["text"], turn, found)})
+            else:
+                parts.append(part)
         return {**message, "content": parts}
 
     # Rounds
@@ -154,6 +176,7 @@ class Harness:
 
     async def _run(self, calls: list[dict], turn: Turn):
         """Runs hub calls in order, yielding the text to emit, or None every 10 s while a tool runs."""
+        images = []
         for call in calls:
             name, arguments = call["function"]["name"], call["function"]["arguments"]
             yield self.tools.progress(name, arguments)
@@ -163,12 +186,14 @@ class Harness:
                     yield None
                 output = task.result()
                 result, text = output.content, output.display
+                images += output.images
             except ToolError as error:
                 result, text = f"error: {error}", f"_{name} failed: {error}_\n\n"
             finally:
                 task.cancel()
             yield text
             turn.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        turn.messages += self._shown(images, turn)  # after the round's tool messages, so the next round sees them
 
     async def _complete(self, turn: Turn, response: httpx.Response) -> Response:
         text, previous = "", None

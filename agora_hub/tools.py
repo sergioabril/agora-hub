@@ -9,13 +9,14 @@ from pathlib import Path
 
 import httpx
 
-FILES_PATH = "/agent/files/"  # where the gateway serves FileStore files
+FILES_PATH = "/files/"  # where the gateway serves FileStore files
 MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|webp)$")
 INSTRUCTIONS = (
-    "Images in this conversation are labelled [image_1], [image_2], … in order. To create an image, call "
-    "generate_image. To change one, call edit_image with its label. The user sees every result automatically, "
-    "so never write image links or markdown for it; describe what you did in one short sentence."
+    "Images in this conversation are labelled [image_1], [image_2], … in order, and you can see each one. To create "
+    "an image, call generate_image. To change one, call edit_image with its label. You see each result after the "
+    "call: if it clearly misses the request, fix it once with edit_image; otherwise don't retry. The user sees every "
+    "result automatically, so never write image links or markdown for it; describe what you did in one short sentence."
 )
 SPECS = [
     {"type": "function", "function": {
@@ -52,6 +53,7 @@ class ToolContext:
 class ToolOutput:
     content: str  # the tool message the model reads
     display: str  # markdown added to the reply the user sees
+    images: list[str]  # FileStore names this call produced, shown to the model after the round
 
 
 class ToolError(Exception):
@@ -84,6 +86,10 @@ class FileStore:
     def path(self, name: str) -> Path | None:
         path = self.folder / name
         return path if FILE_NAME.match(name) and path.is_file() else None
+
+    def data_url(self, name: str) -> str:
+        data = base64.b64encode(self.path(name).read_bytes()).decode()
+        return f"data:{MEDIA_TYPES[name.split('.')[1]]};base64,{data}"
 
 
 class Tools:
@@ -144,4 +150,5 @@ class Tools:
         except (ValueError, KeyError, IndexError, TypeError):
             raise ToolError("image server returned no image")
         label = context.label(name)
-        return ToolOutput(f"{label} is shown to the user", f"![{label}]({context.url(name)})\n\n")
+        return ToolOutput(f"{label} is shown to the user and attached below", f"![{label}]({context.url(name)})\n\n",
+                          [name])
