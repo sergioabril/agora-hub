@@ -10,7 +10,7 @@ from agora_hub.config import DeploymentConfig, load_config
 from agora_hub.controller import Controller
 from agora_hub.gateway import create_gateway
 from agora_hub.harness import SHOWN, Delta, Failed, Finished, Harness, ToolFinished, ToolStarted, UpstreamError
-from agora_hub.tools import IMAGE_NOTE, SEARCH_NOTE, FileStore, Tools
+from agora_hub.tools import IMAGE_NOTE, SEARCH_NOTE, VISION_NOTE, FileStore, Tools
 from tests.fakes import FakeAdapters
 
 KEY = {"Authorization": "Bearer " + "b" * 64}
@@ -19,6 +19,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
 JPG = b"\xff\xd8\xff" + b"j" * 16
 JPG_URL = "data:image/jpeg;base64," + base64.b64encode(JPG).decode()
+NOTES = "\n\n".join((VISION_NOTE, IMAGE_NOTE, SEARCH_NOTE))
 
 
 def upstream(requests, replies):
@@ -220,12 +221,12 @@ async def test_harness_generate(harness):
     assert events[3].output.images == [f"{call.id}.png"]
     first, second = chats(requests)
     assert all(body["stream"] and body["stream_options"] == {"include_usage": True} for body in (first, second))
-    assert [tool["function"]["name"] for tool in first["tools"]] == ["generate_image", "edit_image", "web_search"]
-    assert first["messages"][0] == {"role": "system", "content": IMAGE_NOTE + "\n\n" + SEARCH_NOTE}
+    assert [tool["function"]["name"] for tool in first["tools"]] == ["generate_image", "edit_image", "view_image", "web_search"]
+    assert first["messages"][0] == {"role": "system", "content": NOTES}
     assistant, tool, shown = second["messages"][-3:]
     assert assistant["tool_calls"][0]["function"]["name"] == "generate_image" and assistant["content"] == "Sure."
     assert tool == {"role": "tool", "tool_call_id": "call_generate_image",
-                    "content": "image_1 is shown to the user and attached below"}
+                    "content": "[image_1] is shown to the user"}
     assert shown["content"] == [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_1]"},
                                 {"type": "image_url", "image_url": {"url": PNG_URL}}]
     assert store.path(f"{call.id}.png").stat().st_mode & 0o777 == 0o600
@@ -275,7 +276,7 @@ async def test_harness_tools_and_errors(harness, capsys):
     image.clear()
     replies.append(sse({"content": "ok"}))
     await turn(harness, user)
-    assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["web_search"]
+    assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["view_image", "web_search"]
     events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
     assert events.count("tool.call") == events.count("tool.result") == 2
 
@@ -334,7 +335,7 @@ async def test_responses_input(gateway):
     sent = chats(requests)[0]
     assert reply.status_code == 200 and len(chats(requests)) == 1
     assert sent["messages"] == [
-        {"role": "system", "content": "Be brief.\n\n" + IMAGE_NOTE + "\n\n" + SEARCH_NOTE},
+        {"role": "system", "content": "Be brief.\n\n" + NOTES},
         {"role": "system", "content": "Be kind."},
         {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "text", "text": "[image_1]"},
                                      {"type": "image_url", "image_url": {"url": JPG_URL}}]},
@@ -344,10 +345,49 @@ async def test_responses_input(gateway):
         {"role": "user", "content": [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_2]"},
                                      {"type": "image_url", "image_url": {"url": PNG_URL}}]}]
     assert sent["tools"][0] == {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
-    assert [tool["function"]["name"] for tool in sent["tools"]] == ["lookup", "generate_image", "edit_image", "web_search"]
+    assert [tool["function"]["name"] for tool in sent["tools"]] == ["lookup", "generate_image", "edit_image", "view_image", "web_search"]
     assert sent["tool_choice"] == {"type": "function", "function": {"name": "lookup"}} and sent["max_tokens"] == 50
     assert [(r.status_code, r.json()["error"]["code"]) for r in errors] == [
         (400, "unsupported_parameter"), (400, "unsupported_tool"), (400, "invalid_request")]
+
+
+async def test_responses_replay(gateway):
+    """An image the hub made goes back to the model as its tool call and result, exactly as the model saw them live.
+    Shown as a bare [image_N] in the assistant's own text, it taught the model to write a label instead of calling."""
+    _, adapters, controller, app, requests, replies = gateway
+    await serve(adapters, controller)
+    replies += [sse({"content": "Sure."}, tool_call("generate_image", prompt="a red fox"), finish="tool_calls", joined=True),
+                sse({"content": "Done."})]
+    asked = {"role": "user", "content": "draw a red fox"}
+    async with client(app) as request:
+        output = (await respond(request, input=[asked])).json()["output"]
+        items = [{**item, "result": None} if item["type"] == "image_generation_call" else item for item in output]
+        await respond(request, input=[asked, *items, {"role": "user", "content": "again"}])
+    live, replay = chats(requests)[1]["messages"], chats(requests)[2]["messages"]
+    assert [message["role"] for message in live] == ["system", "user", "assistant", "tool", "user"]
+    assert replay == [*live, {"role": "assistant", "content": "Done."}, {"role": "user", "content": "again"}]
+
+
+async def test_responses_view(gateway):
+    """The model gets the pixels of the latest turn that has images. Older images are labels: it can still edit them,
+    and view_image attaches them again. That call is not an output item."""
+    _, adapters, controller, app, requests, replies = gateway
+    await serve(adapters, controller)
+    replies += [sse(tool_call("edit_image", images=["image_1"], prompt="redder"), finish="tool_calls"),
+                sse(tool_call("view_image", images=["[image_1, not attached]"]), finish="tool_calls"), sse({"content": "Seen."})]
+    photos = [{"role": "user", "content": [{"type": "input_text", "text": text}, {"type": "input_image", "image_url": url}]}
+              for text, url in (("one", JPG_URL), ("two", PNG_URL))]
+    async with client(app) as request:
+        output = (await respond(request, input=[*photos, {"role": "user", "content": "compare"}])).json()["output"]
+    first, _, third = [body["messages"] for body in chats(requests)]
+    assert first[1]["content"] == [{"type": "text", "text": "one"}, {"type": "text", "text": "[image_1, not attached]"}]
+    assert first[2]["content"][1:] == [{"type": "text", "text": "[image_2]"}, {"type": "image_url", "image_url": {"url": PNG_URL}}]
+    edit = next(r for r in requests if r.url.path.endswith("/images/edits")).content
+    assert JPG in edit and b'name="output_format"\r\n\r\njpeg' in edit
+    assert third[-2] == {"role": "tool", "tool_call_id": "call_view_image", "content": "You can see [image_1] now."}
+    assert third[-1]["content"] == [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_1]"},
+                                    {"type": "image_url", "image_url": {"url": JPG_URL}}]
+    assert [item["type"] for item in output] == ["image_generation_call", "message"]
 
 
 async def test_responses_items(gateway, capsys):

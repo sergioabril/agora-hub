@@ -7,7 +7,7 @@ import time
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .harness import Delta, Failed, Finished, Harness, KeepAlive, ToolFinished, ToolStarted
-from .tools import FILES_PATH, FileStore
+from .tools import FILES_PATH, MADE, FileStore
 from .trace import trace
 
 UNSUPPORTED = ("previous_response_id", "conversation", "background")
@@ -72,7 +72,13 @@ def _item(item: dict, messages: list[dict], store: FileStore):
                          "content": _texts(item.get("output"), "input_text", "")})
     elif kind == "image_generation_call" and item.get("status") == "completed":
         item_id = str(item.get("id") or "")
-        name = store.find(item_id[3:]) if item_id.startswith("ig_") else None
+        stem = item_id[3:] if item_id.startswith("ig_") else ""
+        name = store.find(stem)
+        if name and (call := store.call(stem)):  # the hub made it: replay the call and its result, as the model saw them
+            _assistant(messages).setdefault("tool_calls", []).append(call)
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": MADE.format(f"![image]({FILES_PATH}{name})")})
+            return
         if not name and isinstance(item.get("result"), str):
             try:
                 name = store.save(base64.b64decode(item["result"], validate=True))
@@ -173,6 +179,8 @@ class Render:
 
     def started(self, event: ToolStarted) -> list[str]:
         call, out = event.call, self.close()
+        if call.kind == "view":  # the model looks at an older image: nothing for the client to draw
+            return out
         if call.kind == "image":
             item = {"type": "image_generation_call", "id": f"ig_{call.id}", "status": "in_progress",
                     "action": call.action, "revised_prompt": call.text, "result": None}
@@ -186,6 +194,8 @@ class Render:
         return [*out, added, *(self.send(f"{prefix}.{stage}", item_id=item["id"], output_index=index) for stage in stages)]
 
     def finished_tool(self, event: ToolFinished) -> list[str]:
+        if not self.tool:
+            return []
         (item, index, prefix), self.tool, out = self.tool, None, []
         if event.output:
             out.append(self.send(f"{prefix}.completed", item_id=item["id"], output_index=index))

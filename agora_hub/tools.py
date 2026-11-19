@@ -13,13 +13,24 @@ import httpx
 FILES_PATH = "/files/"  # how the harness refers to a stored file in text; no route serves it
 MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|webp)$")
-IMAGE_NOTE = (
-    "Images in this conversation are labelled [image_1], [image_2], … in order, and you can see each one. To create "
-    "an image, call generate_image. To change an image, or to combine up to four, call edit_image with their labels. "
-    "You see each result after the call: if it clearly misses the request, fix it once with edit_image; otherwise "
-    "don't retry. The user sees every result automatically, so never write image links or markdown for it; describe "
-    "what you did in one short sentence."
+VISION_NOTE = (
+    "Images in this conversation are labelled [image_1], [image_2], … in order. You see the recent ones. An older one "
+    'is marked "not attached": you cannot see it until you call view_image with its label, so call it before you '
+    "describe that image or answer a question about how it looks."
 )
+IMAGE_NOTE = (
+    "To create an image, call generate_image. To change an image, or to combine up to four, call edit_image with "
+    "their labels: it works on any image, attached or not. You see each result after the call: if it clearly misses "
+    "the request, fix it once with edit_image; otherwise don't retry. The user sees every result automatically, so "
+    "never write image links or markdown for it; describe what you did in one short sentence."
+)
+MADE = "{} is shown to the user"  # the tool message of a call that made an image: {} is its label
+VIEWED = "You can see {} now."  # the tool message of view_image: {} is the labels
+# The image server encodes the result itself; the hub converts nothing. Its default is an uncompressed PNG (7 MB for
+# 1536×1152), which hit the LLM's 20 MB image limit after three images and slowed the app. JPEG at quality 95 is
+# about a tenth of that. For lossless images use {"output_format": "png", "output_compression": 1}: a third to a half
+# of the default size, and about 3 s more per image.
+IMAGE_OUTPUT = {"output_format": "jpeg", "output_compression": 95}
 SEARCH_NOTE = "To look something up on the web, call web_search."
 SEARCH_TODO = "TO BE IMPLEMENTED: web search isn't available yet. Answer without it and don't call it again."
 
@@ -38,9 +49,13 @@ IMAGE_SPECS = [
          prompt={"type": "string", "description": "What to change. Refer to the images by their order in images: "
                                                   "the first image, the second image."}),
 ]
+VIEW_SPEC = spec("view_image", 'Look at images that are marked "not attached".',
+                 images={"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4,
+                         "description": 'Labels of the images, e.g. ["image_1"].'})
 SEARCH_SPEC = spec("web_search", "Search the web for current information.",
                    query={"type": "string", "description": "What to search for."})
-KINDS = {"generate_image": ("image", "generate"), "edit_image": ("image", "edit"), "web_search": ("search", "search")}
+KINDS = {"generate_image": ("image", "generate"), "edit_image": ("image", "edit"), "view_image": ("view", "view"),
+         "web_search": ("search", "search")}
 
 
 @dataclass
@@ -49,10 +64,10 @@ class Call:
 
     id: str  # 32 random hex digits; Responses item ids and the generated image's file name use it
     tool_call: dict  # the model's call: {"id", "type": "function", "function": {"name", "arguments"}}
-    kind: str  # "image" or "search"
-    action: str  # "generate", "edit" or "search"
+    kind: str  # "image", "view" or "search"
+    action: str  # "generate", "edit", "view" or "search"
     text: str  # the prompt or the query; "" when the arguments don't give one
-    labels: list[str]  # edit: the image labels, in order; [] otherwise
+    labels: list[str]  # edit and view: the image labels, in order; [] otherwise
 
 
 @dataclass
@@ -68,7 +83,7 @@ class ToolContext:
 @dataclass
 class ToolOutput:
     content: str  # the tool message the model reads
-    images: list[str]  # FileStore names this call produced, shown to the model after the round
+    images: list[str]  # FileStore names this call made or asked to see, attached for the model after the round
 
 
 class ToolError(Exception):
@@ -90,13 +105,23 @@ class FileStore:
         else:
             raise ValueError("unsupported image type")
         name = f"{stem or hashlib.sha256(data).hexdigest()[:32]}.{ext}"
-        path = self.folder / name
-        if not path.exists():
-            tmp = self.folder / f"{name}.tmp"
-            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
-                file.write(data)
-            os.replace(tmp, path)
+        if not (self.folder / name).exists():
+            self._write(name, data)
         return name
+
+    def _write(self, name: str, data: bytes):
+        tmp = self.folder / f"{name}.tmp"
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
+            file.write(data)
+        os.replace(tmp, self.folder / name)
+
+    def save_call(self, stem: str, tool_call: dict):
+        """Keeps the tool call that made the image <stem>, next to it, so a later request can replay it."""
+        self._write(f"{stem}.json", json.dumps(tool_call).encode())
+
+    def call(self, stem: str) -> dict | None:
+        path = self.folder / f"{stem}.json"
+        return json.loads(path.read_bytes()) if re.fullmatch("[0-9a-f]{32}", stem) and path.is_file() else None
 
     def path(self, name: str) -> Path | None:
         path = self.folder / name
@@ -122,8 +147,8 @@ class Tools:
 
     def offer(self) -> tuple[list[dict], str]:
         if self.image_target():
-            return [*IMAGE_SPECS, SEARCH_SPEC], IMAGE_NOTE + "\n\n" + SEARCH_NOTE
-        return [SEARCH_SPEC], SEARCH_NOTE
+            return [*IMAGE_SPECS, VIEW_SPEC, SEARCH_SPEC], "\n\n".join((VISION_NOTE, IMAGE_NOTE, SEARCH_NOTE))
+        return [VIEW_SPEC, SEARCH_SPEC], VISION_NOTE + "\n\n" + SEARCH_NOTE
 
     def call(self, tool_call: dict) -> Call:
         function = tool_call["function"]
@@ -132,30 +157,37 @@ class Tools:
         except ValueError:
             args = {}
         args = args if isinstance(args, dict) else {}
-        text = args.get("prompt", args.get("query"))
-        labels = args.get("images") if function["name"] == "edit_image" else None
+        text, labels = args.get("prompt", args.get("query")), args.get("images")
         return Call(secrets.token_hex(16), tool_call, *KINDS[function["name"]], text if isinstance(text, str) else "",
                     [str(label) for label in labels] if isinstance(labels, list) else [])
+
+    def _files(self, call: Call, context: ToolContext) -> list[str]:
+        """The files a call's labels name. Any image of the conversation counts, attached for the model or not."""
+        if not 1 <= len(call.labels) <= 4:
+            raise ToolError(f"{call.tool_call['function']['name']} takes one to four images")
+        files = []
+        for label in call.labels:
+            match = re.search(r"image_([1-9][0-9]*)", label)  # search: the model may copy the brackets or the mark
+            if not match or int(match[1]) > len(context.images):
+                raise ToolError(f"unknown image {label}")
+            files.append(context.images[int(match[1]) - 1])
+        return files
 
     async def run(self, call: Call, context: ToolContext) -> ToolOutput:
         if call.kind == "search":
             raise ToolError(SEARCH_TODO)
+        if call.kind == "view":
+            files = self._files(call, context)
+            return ToolOutput(VIEWED.format(", ".join(f"[{context.label(file)}]" for file in files)), files)
         if not (target := self.image_target()):
             raise ToolError("no image deployment is running")
         if not call.text:
             raise ToolError("invalid arguments")
         base, model = target
-        fields = {"model": model, "prompt": call.text, "n": 1, "response_format": "b64_json"}
+        fields = {"model": model, "prompt": call.text, "n": 1, "response_format": "b64_json", **IMAGE_OUTPUT}
         if call.action == "edit":
-            if not 1 <= len(call.labels) <= 4:
-                raise ToolError("edit_image takes one to four images")
-            images = []
-            for label in call.labels:
-                match = re.fullmatch(r"image_([1-9][0-9]*)", label)
-                if not match or int(match[1]) > len(context.images):
-                    raise ToolError(f"unknown image {label}")
-                file = context.images[int(match[1]) - 1]
-                images.append(("image", (file, self.store.path(file).read_bytes(), MEDIA_TYPES[file.split(".")[1]])))
+            images = [("image", (file, self.store.path(file).read_bytes(), MEDIA_TYPES[file.split(".")[1]]))
+                      for file in self._files(call, context)]
             request = {"url": f"{base}/images/edits", "data": {k: str(v) for k, v in fields.items()}, "files": images}
         else:
             request = {"url": f"{base}/images/generations", "json": fields}
@@ -169,4 +201,5 @@ class Tools:
             name = self.store.save(base64.b64decode(response.json()["data"][0]["b64_json"], validate=True), call.id)
         except (ValueError, KeyError, IndexError, TypeError):
             raise ToolError("image server returned no image")
-        return ToolOutput(f"{context.label(name)} is shown to the user and attached below", [name])
+        self.store.save_call(call.id, call.tool_call)
+        return ToolOutput(MADE.format(f"[{context.label(name)}]"), [name])

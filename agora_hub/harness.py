@@ -112,6 +112,7 @@ class Turn:
     hub_tools: list[dict]
     note: str
     round: int = 1  # number of the upstream call being made or read
+    visible: set[str] = field(default_factory=set)  # file names the model may get as image parts in this turn
     attached: set[str] = field(default_factory=set)  # file names already sent to the model as image parts
     response: httpx.Response | None = None  # the round being read
 
@@ -149,6 +150,12 @@ class Harness:
         specs, note = self.tools.offer()
         hub_tools = [tool for tool in specs if tool["function"]["name"] not in taken]
         turn = Turn(body, url, request_id, ToolContext([]), [], client_tools, hub_tools, note)
+        number, seen = 0, {}  # turn number -> the images that turn refers to; a user message starts a turn
+        for message in body["messages"]:
+            number += message.get("role") == "user"
+            seen.setdefault(number, []).extend(self._names(message))
+        earlier = [n for n, names in seen.items() if names and n < number]
+        turn.visible = {name for n in (*earlier[-1:], number) for name in seen.get(n, [])}
         found = []  # names first seen as links, shown after the message and the tool messages that follow it
         for message in body["messages"]:
             if message.get("role") != "tool":
@@ -160,10 +167,14 @@ class Harness:
             raise error
         return turn
 
-    # Request rewrite: each image reaches the model once, as its [image_N] label plus a data URL part.
+    # Request rewrite: every image gets its [image_N] label. The model gets the pixels, once each, of the images in
+    # view: those of the current turn and of the latest earlier turn that has any. The rest are marked not attached.
 
     def _attach(self, name: str, turn: Turn) -> list[dict]:
-        parts = [{"type": "text", "text": f"[{turn.context.label(name)}]"}]
+        label = turn.context.label(name)
+        if name not in turn.visible:
+            return [{"type": "text", "text": f"[{label}, not attached]"}]
+        parts = [{"type": "text", "text": f"[{label}]"}]
         if name not in turn.attached:
             turn.attached.add(name)
             parts.append({"type": "image_url", "image_url": {"url": self.store.data_url(name)}})
@@ -171,7 +182,8 @@ class Harness:
 
     def _shown(self, names: list[str], turn: Turn) -> list[dict]:
         parts = [part for name in names if name not in turn.attached for part in self._attach(name, turn)]
-        return [{"role": "user", "content": [{"type": "text", "text": SHOWN}, *parts]}] if parts else []
+        header = [{"type": "text", "text": SHOWN}] if any(part["type"] == "image_url" for part in parts) else []
+        return [{"role": "user", "content": [*header, *parts]}] if parts else []
 
     def _file(self, url: str) -> str | None:
         try:
@@ -190,16 +202,25 @@ class Harness:
 
         return MARKDOWN_IMAGE.sub(label, text)
 
-    def _image(self, part: dict, turn: Turn) -> list[dict]:
+    def _name(self, part: dict) -> str | None:
+        """The stored file an image part refers to; a data URL is saved on the way."""
         url = (part.get("image_url") or {}).get("url") or ""
-        if match := DATA_URL.match(url):
-            try:
-                name = self.store.save(base64.b64decode(match[1], validate=True))
-            except ValueError:
-                name = None
-        else:
-            name = self._file(url)
-        return self._attach(name, turn) if name else [{"type": "text", "text": "[image unavailable]"}]
+        if not (match := DATA_URL.match(url)):
+            return self._file(url)
+        try:
+            return self.store.save(base64.b64decode(match[1], validate=True))
+        except ValueError:
+            return None
+
+    def _names(self, message: dict) -> list[str]:
+        """The stored images a message refers to, as image parts or as links in its text."""
+        content, names = message.get("content"), []
+        for part in content if isinstance(content, list) else [{"type": "text", "text": content}]:
+            if part.get("type") == "image_url":
+                names.append(self._name(part))
+            elif part.get("type") == "text" and isinstance(part.get("text"), str):
+                names += [self._file(match[1]) for match in MARKDOWN_IMAGE.finditer(part["text"])]
+        return [name for name in names if name]
 
     def _message(self, message: dict, turn: Turn, found: list[str]) -> dict:
         content = message.get("content")
@@ -210,7 +231,8 @@ class Harness:
         parts = []
         for part in content:
             if part.get("type") == "image_url":
-                parts += self._image(part, turn)
+                name = self._name(part)
+                parts += self._attach(name, turn) if name else [{"type": "text", "text": "[image unavailable]"}]
             elif part.get("type") == "text" and isinstance(part.get("text"), str):
                 parts.append({**part, "text": self._text(part["text"], turn, found)})
             else:
@@ -309,6 +331,7 @@ class Harness:
                             yield event
                     finally:
                         await tool.aclose()
+                turn.visible.update(images)  # what a turn makes or asks to see stays in view while it runs
                 turn.messages += self._shown(images, turn)  # after the round's tool messages, so the next round sees them
                 if not hub_calls or client_calls:
                     yield Finished(client_calls, message.finish)

@@ -207,7 +207,7 @@ When `gateway.api_keys` is set, `/openai/v1` requires `Authorization: Bearer <ga
 The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the key and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
 
 - Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
-- `files/` (in the config folder) holds the images the Responses harness stores. It is never cleaned up and not served over HTTP.
+- `files/` (in the config folder) holds the images the Responses harness stores and, next to each image it generated, the tool call that made it (`<id>.json`). It is never cleaned up and not served over HTTP.
 
 ```sh
 KEY=your-64-character-gateway-key
@@ -226,13 +226,16 @@ curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 - **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls` and `max_output_tokens`. Everything else (`store`, `include`, `metadata`, `text`, `reasoning`, `user`, …) is ignored; the response echoes `metadata`, and `store` is always `false` and `usage` `null`.
 - **Input items:** `message` (user, system, developer and assistant), `function_call`, `function_call_output` and `image_generation_call`. `reasoning` and `web_search_call` items are skipped; any other type answers `400 invalid_request`.
 - **The harness:**
-  - the model sees every image as `[image_N]` plus the image, including the ones it generated, so it can check a result and fix it once;
-  - image generation, and editing of up to four images, while an image deployment runs;
+  - every image is labelled `[image_N]`, in order, including the ones the model generated;
+  - the model gets the pixels of the images in view: those of the current turn (a user message starts a turn) and of the latest earlier turn that has any, plus everything the turn makes, so it can check a result and fix it once. Older images reach it as `[image_N, not attached]`, which keeps requests small however long the chat gets;
+  - `view_image`, always: the model calls it to look at a not-attached image again. The call is not an output item;
+  - a generated image you send back reaches the model as the tool call that made it and its result, as in the turn that made it. As a bare `[image_N]` in the assistant's own text, it taught the model to answer with a label instead of calling the tool;
+  - image generation, and editing of up to four images, while an image deployment runs. Editing works on any image of the conversation, attached or not: the hub reads the file by its label;
   - `web_search`, always: a stub for now, whose item ends `failed`;
   - your own `function` tools, which come back as `function_call` items;
   - a 10-round backstop, and a disconnect stops the turn.
 - **Images in:** `input_image` with a data URL, in JPEG, PNG or WebP. Convert HEIC first, and downscale large photos. Other URLs are unavailable to the model.
-- **Images out:** `image_generation_call` items carry `result` (base64), `output_format`, `action` (`generate` or `edit`) and `revised_prompt` (the prompt the model wrote). Send them back with `"result": null`: the hub finds the image by its id.
+- **Images out:** `image_generation_call` items carry `result` (base64), `output_format`, `action` (`generate` or `edit`) and `revised_prompt` (the prompt the model wrote). Send them back with `"result": null`: the hub finds the image, and the call that made it, by its id. They are JPEG at quality 95: the hub asks the image server for that (`IMAGE_OUTPUT` in `tools.py`) and converts nothing itself. The server's default, an uncompressed PNG, is ten times the size.
 - **Reasoning:** a thinking model's reasoning arrives as a `reasoning` item. It's never sent back to the model.
 - **Errors:** the HTTP errors in the table above. A failure after the first round ends the turn with `status: "failed"` (`response.failed` when streaming); `finish_reason: length` ends it `incomplete`.
 
