@@ -2,41 +2,101 @@ import asyncio
 import base64
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import httpx
-from starlette.responses import JSONResponse, Response, StreamingResponse
 
-from .tools import FILES_PATH, FileStore, ToolContext, ToolError, Tools
+from .tools import FILES_PATH, Call, FileStore, ToolContext, ToolError, ToolOutput, Tools
+from .trace import trace
 
 MAX_ROUNDS = 10  # runaway backstop only; a normal reply ends after 1–3 calls
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,(.*)", re.S)
-DONE = "data: [DONE]\n\n"
 SHOWN = "Images shown above, attached so you can see them:"
 
 
-class BadRequest(Exception):
-    pass
-
-
 class UpstreamDown(Exception):
-    pass
+    """The first LLM call couldn't connect."""
+
+
+class UpstreamError(Exception):
+    """The first LLM call answered non-2xx."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status, self.message = status, message
 
 
 def error_text(error: Exception) -> str:
     return str(error) or type(error).__name__
 
 
-def raw(response: httpx.Response) -> Response:
-    return Response(response.content, response.status_code, media_type=response.headers.get("content-type"))
+@dataclass
+class Delta:
+    text: str
+    reasoning: str
 
 
-def chunk(last: dict, delta: dict, finish: str | None = None) -> str:
-    head = {"id": last.get("id"), "object": "chat.completion.chunk", "created": last.get("created"),
-            "model": last.get("model")}
-    return f"data: {json.dumps({**head, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
+@dataclass
+class ToolStarted:
+    call: Call
+
+
+@dataclass
+class KeepAlive:
+    pass
+
+
+@dataclass
+class ToolFinished:
+    call: Call
+    output: ToolOutput | None
+    error: str | None
+
+
+@dataclass
+class Finished:
+    calls: list[dict]  # the client tool calls the turn ends with, in chat format
+    finish: str | None  # the last round's finish_reason
+
+
+@dataclass
+class Failed:
+    error: str
+
+
+class Message:
+    """Collects a streamed chat completion into one assistant message."""
+
+    def __init__(self):
+        self.content, self.reasoning, self.finish, self.usage, self.calls = "", "", None, None, {}
+
+    def add(self, chunk: dict) -> tuple[str, str]:
+        if chunk.get("usage"):
+            self.usage = chunk["usage"]
+        choice = (chunk.get("choices") or [{}])[0]
+        self.finish = choice.get("finish_reason") or self.finish
+        delta = choice.get("delta") or {}
+        for piece in delta.get("tool_calls") or []:
+            call = self.calls.setdefault(piece.get("index", 0), {"id": None, "type": "function",
+                                                                 "function": {"name": "", "arguments": ""}})
+            function = piece.get("function") or {}
+            call["id"] = call["id"] or piece.get("id")
+            call["function"]["name"] = call["function"]["name"] or function.get("name") or ""
+            call["function"]["arguments"] += function.get("arguments") or ""
+        content, reasoning = delta.get("content") or "", delta.get("reasoning") or delta.get("reasoning_content") or ""
+        self.content += content
+        self.reasoning += reasoning
+        return content, reasoning
+
+    def tool_calls(self) -> list[dict]:
+        return [self.calls[index] for index in sorted(self.calls)]
+
+    def summary(self) -> dict:
+        return {"content": self.content, "reasoning": self.reasoning, "tool_calls": self.tool_calls(),
+                "finish_reason": self.finish, "usage": self.usage}
 
 
 @dataclass
@@ -45,6 +105,7 @@ class Turn:
 
     body: dict
     url: str
+    request_id: str
     context: ToolContext
     messages: list[dict]
     client_tools: list[dict]
@@ -52,6 +113,7 @@ class Turn:
     note: str
     round: int = 1  # number of the upstream call being made or read
     attached: set[str] = field(default_factory=set)  # file names already sent to the model as image parts
+    response: httpx.Response | None = None  # the round being read
 
     def payload(self) -> dict:
         final = self.round == MAX_ROUNDS
@@ -63,7 +125,7 @@ class Turn:
                 messages = [{**first, "content": first["content"] + "\n\n" + self.note}, *messages[1:]]
             else:
                 messages = [{"role": "system", "content": self.note}, *messages]
-        payload = {**self.body, "messages": messages}
+        payload = {**self.body, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
         if tools := self.client_tools + hub:
             payload["tools"] = tools
         elif final:
@@ -81,16 +143,12 @@ class Harness:
     def __init__(self, client: httpx.AsyncClient, tools: Tools, store: FileStore):
         self.client, self.tools, self.store = client, tools, store
 
-    async def chat(self, body: dict, url: str, base_url: str) -> Response:
-        if body.get("n") not in (None, 1):
-            raise BadRequest("n must be 1")
-        if not isinstance(body.get("messages"), list):
-            raise BadRequest("messages must be a list")
-        context = ToolContext([], base_url)
+    async def start(self, body: dict, url: str, request_id: str) -> Turn:
         client_tools = body.get("tools") or []
         taken = {tool.get("function", {}).get("name") for tool in client_tools}
-        hub_tools = [tool for tool in self.tools.specs() if tool["function"]["name"] not in taken]
-        turn = Turn(body, url, context, [], client_tools, hub_tools, self.tools.instructions())
+        specs, note = self.tools.offer()
+        hub_tools = [tool for tool in specs if tool["function"]["name"] not in taken]
+        turn = Turn(body, url, request_id, ToolContext([]), [], client_tools, hub_tools, note)
         found = []  # names first seen as links, shown after the message and the tool messages that follow it
         for message in body["messages"]:
             if message.get("role") != "tool":
@@ -98,19 +156,9 @@ class Harness:
                 found = []
             turn.messages.append(self._message(message, turn, found))
         turn.messages += self._shown(found, turn)
-        stream = bool(body.get("stream"))
-        try:
-            response = await self._send(turn, stream)
-        except httpx.RequestError as error:
-            raise UpstreamDown(error_text(error))
-        if not response.is_success:
-            if stream:
-                await response.aread()
-            return raw(response)
-        if not stream:
-            return await self._complete(turn, response)
-        headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-        return StreamingResponse(self._stream(turn, response), media_type="text/event-stream", headers=headers)
+        if error := await self._send(turn):
+            raise error
+        return turn
 
     # Request rewrite: each image reaches the model once, as its [image_N] label plus a data URL part.
 
@@ -171,123 +219,103 @@ class Harness:
 
     # Rounds
 
-    async def _send(self, turn: Turn, stream: bool) -> httpx.Response:
-        return await self.client.send(self.client.build_request("POST", turn.url, json=turn.payload()), stream=stream)
+    async def _send(self, turn: Turn) -> Exception | None:
+        """Sends a round, leaving its streamed response in turn.response; returns the error instead when it fails."""
+        payload = turn.payload()
+        trace(turn.request_id, "upstream.request", round=turn.round, url=turn.url, body=payload)
+        try:
+            response = await self.client.send(self.client.build_request("POST", turn.url, json=payload), stream=True)
+        except httpx.RequestError as error:
+            trace(turn.request_id, "upstream.error", round=turn.round, error=error_text(error))
+            return UpstreamDown(error_text(error))
+        if response.is_success:
+            turn.response = response
+            return None
+        try:
+            await response.aread()
+        finally:
+            await response.aclose()
+        try:
+            data = response.json()
+        except ValueError:
+            data = response.text
+        trace(turn.request_id, "upstream.response", round=turn.round, status=response.status_code, body=data)
+        error = data.get("error") if isinstance(data, dict) else None
+        message = ((error.get("message") if isinstance(error, dict) else None)
+                   or (data.get("message") if isinstance(data, dict) else None))
+        return UpstreamError(response.status_code, message or f"upstream returned HTTP {response.status_code}")
 
-    async def _run(self, calls: list[dict], turn: Turn):
-        """Runs hub calls in order, yielding the text to emit, or None every 10 s while a tool runs."""
-        images = []
-        for call in calls:
-            name, arguments = call["function"]["name"], call["function"]["arguments"]
-            yield self.tools.progress(name, arguments)
-            task = asyncio.ensure_future(self.tools.run(name, arguments, turn.context))
-            try:
-                while not (await asyncio.wait({task}, timeout=10))[0]:
-                    yield None
-                output = task.result()
-                result, text = output.content, output.display
-                images += output.images
-            except ToolError as error:
-                result, text = f"error: {error}", f"_{name} failed: {error}_\n\n"
-            finally:
-                task.cancel()
-            yield text
-            turn.messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
-        turn.messages += self._shown(images, turn)  # after the round's tool messages, so the next round sees them
+    async def _tool(self, tool_call: dict, turn: Turn, images: list[str]):
+        """Runs one hub call, yielding its events, then appends its tool message."""
+        call = self.tools.call(tool_call)
+        trace(turn.request_id, "tool.call", call=call.id, name=tool_call["function"]["name"],
+              arguments=tool_call["function"]["arguments"])
+        yield ToolStarted(call)
+        started = time.monotonic()
+        task = asyncio.ensure_future(self.tools.run(call, turn.context))
+        try:
+            while not (await asyncio.wait({task}, timeout=10))[0]:
+                yield KeepAlive()
+            output, error = task.result(), None
+        except ToolError as exception:
+            output, error = None, str(exception)
+        finally:
+            task.cancel()
+        seconds = round(time.monotonic() - started, 3)
+        if output:
+            trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, content=output.content,
+                  images=output.images)
+            images += output.images
+        else:
+            trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, error=error)
+        yield ToolFinished(call, output, error)
+        turn.messages.append({"role": "tool", "tool_call_id": tool_call["id"],
+                              "content": output.content if output else f"error: {error}"})
 
-    async def _complete(self, turn: Turn, response: httpx.Response) -> Response:
-        text, previous = "", None
-        while True:
-            try:
-                data = response.json()
-                message = data["choices"][0]["message"]
-            except (ValueError, KeyError, IndexError, TypeError):
-                data = message = None
-            hub_calls, client_calls = turn.split((message or {}).get("tool_calls") or [])
-            if previous is None and not hub_calls:
-                return raw(response)
-            if data is None:
-                return self._ended(previous, text, "upstream returned invalid JSON")
-            text += message.get("content") or ""
-            if hub_calls and not client_calls:
-                turn.messages.append({"role": "assistant", "content": message.get("content") or None,
-                                      "tool_calls": hub_calls})
-            async for line in self._run(hub_calls, turn):
-                text += line or ""
-            if not hub_calls or client_calls:
-                message["content"] = text
-                if client_calls:
-                    message["tool_calls"] = client_calls
-                return JSONResponse(data)
-            previous = data
-            turn.round += 1
-            try:
-                response = await self._send(turn, False)
-            except httpx.RequestError as error:
-                return self._ended(previous, text, error_text(error))
-            if not response.is_success:
-                return self._ended(previous, text, f"upstream returned HTTP {response.status_code}")
-
-    @staticmethod
-    def _ended(data: dict, text: str, error: str) -> Response:
-        choice = data["choices"][0]
-        choice["message"]["content"] = f"{text}\n\n_error: {error}_"
-        choice["message"].pop("tool_calls", None)
-        choice["finish_reason"] = "stop"
-        return JSONResponse(data)
-
-    async def _stream(self, turn: Turn, upstream: httpx.Response):
-        last = {}
+    async def events(self, turn: Turn):
+        """Yields the turn's events, round after round, until Finished or Failed."""
         try:
             while True:
-                calls, held, content = {}, [], ""
-                async for line in upstream.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    if (data := line[5:].strip()) == "[DONE]":
-                        break
-                    try:
-                        last = json.loads(data)
-                    except ValueError:
-                        yield line + "\n\n"
-                        continue
-                    choice = (last.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-                    for piece in delta.get("tool_calls") or []:
-                        call = calls.setdefault(piece.get("index", 0), {"id": None, "type": "function",
-                                                                        "function": {"name": "", "arguments": ""}})
-                        function = piece.get("function") or {}
-                        call["id"] = call["id"] or piece.get("id")
-                        call["function"]["name"] = call["function"]["name"] or function.get("name") or ""
-                        call["function"]["arguments"] += function.get("arguments") or ""
-                    if delta.get("tool_calls"):
-                        if choice.get("finish_reason"):  # vLLM: last call delta and finish in one chunk
-                            held.append(chunk(last, {}, choice["finish_reason"]))
-                        continue
-                    if not last.get("choices") or choice.get("finish_reason"):
-                        held.append(line + "\n\n")
-                    else:
-                        content += delta.get("content") or ""
-                        yield line + "\n\n"
-                await upstream.aclose()
-                hub_calls, client_calls = turn.split([calls[index] for index in sorted(calls)])
+                message = Message()
+                try:
+                    async for line in turn.response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        if (data := line[5:].strip()) == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except ValueError:
+                            continue
+                        text, reasoning = message.add(chunk)
+                        if text or reasoning:
+                            yield Delta(text, reasoning)
+                except httpx.HTTPError as error:
+                    trace(turn.request_id, "upstream.error", round=turn.round, error=error_text(error))
+                    yield Failed(error_text(error))
+                    return
+                await turn.response.aclose()
+                trace(turn.request_id, "upstream.response", round=turn.round, status=turn.response.status_code,
+                      message=message.summary())
+                hub_calls, client_calls = turn.split(message.tool_calls())
                 if hub_calls and not client_calls:
-                    turn.messages.append({"role": "assistant", "content": content or None, "tool_calls": hub_calls})
-                async for text in self._run(hub_calls, turn):
-                    yield ": keep-alive\n\n" if text is None else chunk(last, {"content": text})
+                    turn.messages.append({"role": "assistant", "content": message.content or None,
+                                          "tool_calls": hub_calls})
+                images = []
+                for tool_call in hub_calls:
+                    tool = self._tool(tool_call, turn, images)
+                    try:
+                        async for event in tool:
+                            yield event
+                    finally:
+                        await tool.aclose()
+                turn.messages += self._shown(images, turn)  # after the round's tool messages, so the next round sees them
                 if not hub_calls or client_calls:
-                    for index, call in enumerate(client_calls):
-                        yield chunk(last, {"tool_calls": [{"index": index, **call}]})
-                    yield "".join(held) + DONE
+                    yield Finished(client_calls, message.finish)
                     return
                 turn.round += 1
-                try:
-                    upstream = await self._send(turn, True)
-                    error = None if upstream.is_success else f"upstream returned HTTP {upstream.status_code}"
-                except httpx.RequestError as exception:
-                    error = error_text(exception)
-                if error:
-                    yield chunk(last, {"content": f"\n\n_error: {error}_"}) + chunk(last, {}, "stop") + DONE
+                if error := await self._send(turn):
+                    yield Failed(str(error))
                     return
         finally:
-            await upstream.aclose()
+            await turn.response.aclose()

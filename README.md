@@ -2,7 +2,7 @@
 
 ## 1. Intro
 
-Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule. The hub also serves an OpenAI-compatible gateway on `:8888` at `/openai/v1`: chat with the running LLMs, with image tools backed by image deployments.
+Agora Hub is a headless service for observing and controlling configured machines and their model deployment. It keeps runtime state in memory and can apply a daily wake/shutdown schedule. The hub also serves an OpenAI-compatible gateway on `:8888` at `/openai/v1`: OpenAI chat completions, as a plain pass-through to the running LLMs, and the OpenAI Responses API, which runs through the hub's harness (vision, image tools, web search, reasoning).
 
 ## 2. Quick install
 
@@ -45,7 +45,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"host":"192.168.1.10","por
 
 SSH host keys are trusted on first use, like `ssh -o StrictHostKeyChecking=accept-new`: the first time the hub connects to a host that isn't in `known_hosts`, it saves that host's key there. From then on, the host must keep presenting a saved key, or the hub refuses to connect and reports a `host_key` error, so a machine impersonating it can't collect the SSH or sudo password. After a legitimate key change (a reinstall), remove the old entry with `ssh-keygen -R <host> -f ~/.config/agora/agora-hub/known_hosts`; the next connection saves the new key. `known_hosts` is read on every SSH connection, so no restart is needed.
 
-Logs: `docker logs -f agora-hub`. Undeploy: `docker rm -f agora-hub`.
+Logs: `docker logs -f agora-hub` (the gateway's conversation log is described in §4). Undeploy: `docker rm -f agora-hub`.
 
 ## 3. Config files
 
@@ -120,7 +120,7 @@ deployments:
     endpoint: http://spark-4.local:8001/v1
 ```
 
-`kind` is required. `llm` deployments serve OpenAI chat completions. They must accept image input: the gateway sends them every image in the conversation. `image` deployments speak the OpenAI Images API (`/images/generations` and `/images/edits` with `b64_json`), list at least one model at `/models`, and back the gateway's image tools; clients never reach them directly. Any engine works (vLLM, SGLang, TensorFold, …) as long as it speaks these APIs.
+`kind` is required. `llm` deployments serve OpenAI chat completions. Chat clients' images reach them unchanged, so they should accept image input. `image` deployments speak the OpenAI Images API (`/images/generations` and `/images/edits` with `b64_json`), list at least one model at `/models`, and back the hub's image tools. Their `/images/edits` must accept up to four repeated `image` fields, because an edit can combine images; Qwen-Image-2.1 on vLLM-Omni does. Clients never reach image deployments directly. Any engine works (vLLM, SGLang, TensorFold, …) as long as it speaks these APIs.
 
 Each key is the deployment id (hub-generated for deployments added through the API; `add` is reserved). `start_command` and `stop_command` start with an absolute path and may take arguments (`/home/agora/pro/start.sh --tp 4`). They run on `head` from the SSH user's home with no `cd` (a script that needs its own folder does `cd "$(dirname "$0")"`), with stdin closed. The start script must exit after launching the model; after it exits 0, the hub waits for `<endpoint>/models` to answer 2xx within `deployment_start_seconds`. `endpoint` is the OpenAI-compatible base URL that agents use, usually ending in `/v1` (`http://spark-1.local:8000/v1`, not `…/v1/models`). The hub probes `<endpoint>/models` for status: any 2xx means the deployment is up, and the `id` of each entry in the response's `data` list is a model the deployment serves.
 
@@ -200,14 +200,14 @@ When `gateway.api_keys` is set, `/openai/v1` requires `Authorization: Bearer <ga
 | Method and path | Auth | What it does |
 | --- | --- | --- |
 | `GET /openai/v1/models` | key | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
-| `POST /openai/v1/chat/completions` | key | Chat through the hub's harness (below). Errors: `400 invalid_request` (the body isn't a JSON object, `model` is missing or not a string, `messages` isn't a list, or `n` isn't 1), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the first LLM call couldn't connect), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). |
-| Any other method or path under `/openai/v1/` | key | `404 not_found`, naming the two routes above. `GET /openai/v1/chat/completions` gets it too. |
-| `GET /files/{name}` | none | An image the harness stored or generated, cached as immutable; `404 file_not_found` otherwise. |
+| `POST /openai/v1/chat/completions` | key | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
+| `POST /openai/v1/responses` | key | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
+| Any other method or path under `/openai/v1/` | key | `404 not_found`, naming the three routes above. `GET /openai/v1/chat/completions` and `GET /openai/v1/responses/<id>` get it too. |
 
-The harness runs the tool loop in the hub. While an image deployment runs, the hub offers `generate_image` and `edit_image`; the reply shows a progress line, then the image. The hub runs its own tool calls, while calls to the client's tools go back to the client. The loop runs until the model answers, with a 10-call backstop. `n` must be 1. A client disconnect stops the turn, streaming or not: the model's generation and any running tool. The model sees every image as `[image_N]` plus the image, including the ones it generated, so it can check a result and fix it once. Images from other URLs are unavailable to it.
+The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the key and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
 
-- Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub uses it for image links and reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
-- `files/` (in the config folder) holds the gateway's images: content-addressed (a file's name is its hash), never cleaned up, and served at `/files/<name>` without auth. Image links use the public host (or, without one, the host the client called).
+- Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
+- `files/` (in the config folder) holds the images the Responses harness stores. It is never cleaned up and not served over HTTP.
 
 ```sh
 KEY=your-64-character-gateway-key
@@ -215,13 +215,74 @@ curl -H "Authorization: Bearer $KEY" http://localhost:8888/openai/v1/models
 curl -N -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"model":"agora","stream":true,"messages":[{"role":"user","content":"hi"}]}' http://localhost:8888/openai/v1/chat/completions
 curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"agora","messages":[{"role":"user","content":"draw a red fox"}]}' http://localhost:8888/openai/v1/chat/completions
+  -d '{"model":"agora","messages":[{"role":"user","content":"hi"}]}' http://localhost:8888/openai/v1/chat/completions
 ```
 
-APIs the gateway doesn't serve yet: a coding agent that needs one (Codex speaks only the Responses API) can use a deployment's own endpoint directly. That endpoint has no gateway key and no `agora` alias.
+### Responses API
+
+`POST /openai/v1/responses` is for apps: chat, photos the model sees, image generation and editing, and web search.
+
+- **Stateless.** Send the whole conversation each time: your earlier input plus every output item you received. `previous_response_id`, `conversation` and `background: true` answer `400 unsupported_parameter`.
+- **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls` and `max_output_tokens`. Everything else (`store`, `include`, `metadata`, `text`, `reasoning`, `user`, …) is ignored; the response echoes `metadata`, and `store` is always `false` and `usage` `null`.
+- **Input items:** `message` (user, system, developer and assistant), `function_call`, `function_call_output` and `image_generation_call`. `reasoning` and `web_search_call` items are skipped; any other type answers `400 invalid_request`.
+- **The harness:**
+  - the model sees every image as `[image_N]` plus the image, including the ones it generated, so it can check a result and fix it once;
+  - image generation, and editing of up to four images, while an image deployment runs;
+  - `web_search`, always: a stub for now, whose item ends `failed`;
+  - your own `function` tools, which come back as `function_call` items;
+  - a 10-round backstop, and a disconnect stops the turn.
+- **Images in:** `input_image` with a data URL, in JPEG, PNG or WebP. Convert HEIC first, and downscale large photos. Other URLs are unavailable to the model.
+- **Images out:** `image_generation_call` items carry `result` (base64), `output_format`, `action` (`generate` or `edit`) and `revised_prompt` (the prompt the model wrote). Send them back with `"result": null`: the hub finds the image by its id.
+- **Reasoning:** a thinking model's reasoning arrives as a `reasoning` item. It's never sent back to the model.
+- **Errors:** the HTTP errors in the table above. A failure after the first round ends the turn with `status: "failed"` (`response.failed` when streaming); `finish_reason: length` ends it `incomplete`.
+
+With `stream: true` the events are typed, so an app can draw one card per tool call and update it in place. `: keep-alive` comments go out every 10 s while a tool runs, and there is no `[DONE]`. "draw a red fox", shortened:
+
+```
+response.created, response.in_progress
+response.output_item.added (reasoning) … response.reasoning_text.delta … response.output_item.done
+response.output_item.added (message)   … response.output_text.delta "Sure, drawing it." … response.output_item.done
+response.output_item.added (image_generation_call, in_progress, action, revised_prompt)
+response.image_generation_call.in_progress, response.image_generation_call.generating, : keep-alive
+response.image_generation_call.completed
+response.output_item.done (image_generation_call, completed, result, output_format)
+response.output_item.added (message)   … "Here's your fox." … response.output_item.done
+response.completed (the response object with all four items)
+```
+
+Without `stream`, the body is the final response object, with HTTP 200 whether it ended `completed`, `incomplete` or `failed`.
+
+```sh
+curl -N -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"agora","stream":true,"input":"draw a red fox"}' http://localhost:8888/openai/v1/responses
+```
+
+### Logs
+
+Every gateway request is logged to stdout as JSON lines: `{"time", "request", "event", …}`, one line per event. Read them with `docker logs -f agora-hub | grep --line-buffered '^{' | jq .` (uvicorn's access lines aren't JSON).
+
+| Event | Logged by | Fields |
+| --- | --- | --- |
+| `request` | the gateway, each route | `endpoint` (`chat/completions` or `responses`), `body`: the client's body as received |
+| `upstream.request` | the chat route; the harness, each round | `round` (harness only), `url`, `body`: what the hub sent |
+| `upstream.response` | same | `round` (harness only), `status`, and either `message` (a streamed reply, collected into one assistant message: `content`, `reasoning`, `tool_calls`, `finish_reason`, `usage`) or `body` (any other reply: its JSON, or its text) |
+| `upstream.error` | same | `round` (harness only), `error`: the connection failed, or the stream broke while being read |
+| `tool.call` | the harness | `call`, `name`, `arguments` |
+| `tool.result` | the harness | `call`, `seconds`, and `content` and `images`, or `error` |
+| `response` | the Responses route | `response`: the final response object |
+| `disconnect` | the gateway | the client left; while streaming, what it got so far: `message` (chat) or `response` (Responses) |
+| `error` | the gateway | `status`, `code`, `message` of an error the hub answered |
+
+Request ids: chat requests get `chat_<16 hex>`, Responses requests their response id, `resp_<32 hex>`. Every line of a request carries its id; an error before the body is parsed (a bad key, a bad body) has `"request": null`.
+
+Images are shortened: a base64 data URL keeps its `data:…;base64,` head followed by `<N chars>`, and a long `result` or `b64_json` becomes `<N chars>`. Everything else, including what users send, is logged in full, so treat the host's Docker logs as sensitive. Docker keeps 5 × 20 MB per container, and each `make deploy` starts a fresh log.
+
+APIs the gateway doesn't serve yet: a coding agent that needs one (Codex needs Responses features the hub doesn't have) can use a deployment's own endpoint directly. That endpoint has no gateway key and no `agora` alias.
 
 Planned (not built yet):
 
-- **Resumable runs.** Today a disconnect stops the turn. A client will be able to opt in with `store: true`: the turn then keeps running without it, the client resumes the stream by the completion's `id` and the last chunk it received, and a cancel call stops it. Clients that don't opt in keep today's behaviour.
-- **More API formats**, each under its own prefix and through the same harness: Anthropic Messages at `/anthropic/v1` (Claude Code, the Anthropic SDKs) and OpenAI Responses at `/openai/v1/responses` (Codex).
-- **More host tools**, such as web search.
+- **Stored responses and resumable runs:** `store` and `previous_response_id`, plus `background` turns that the client can resume by response id and the last `sequence_number` it got, or cancel.
+- **Web search** for real, behind the same tool.
+- **Partial images** while generating, once the image server streams them.
+- **Codex** on `/openai/v1/responses`: custom and shell tool types, and encrypted reasoning.
+- **Anthropic Messages** at `/anthropic/v1`, through the same harness.

@@ -3,56 +3,71 @@ import hashlib
 import json
 import os
 import re
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
-FILES_PATH = "/files/"  # where the gateway serves FileStore files
+FILES_PATH = "/files/"  # how the harness refers to a stored file in text; no route serves it
 MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|webp)$")
-INSTRUCTIONS = (
+IMAGE_NOTE = (
     "Images in this conversation are labelled [image_1], [image_2], … in order, and you can see each one. To create "
-    "an image, call generate_image. To change one, call edit_image with its label. You see each result after the "
-    "call: if it clearly misses the request, fix it once with edit_image; otherwise don't retry. The user sees every "
-    "result automatically, so never write image links or markdown for it; describe what you did in one short sentence."
+    "an image, call generate_image. To change an image, or to combine up to four, call edit_image with their labels. "
+    "You see each result after the call: if it clearly misses the request, fix it once with edit_image; otherwise "
+    "don't retry. The user sees every result automatically, so never write image links or markdown for it; describe "
+    "what you did in one short sentence."
 )
-SPECS = [
-    {"type": "function", "function": {
-        "name": "generate_image", "description": "Create a new image from a text description.",
-        "parameters": {"type": "object", "properties": {
-            "prompt": {"type": "string", "description": "What the image shows, in detail."},
-        }, "required": ["prompt"]},
-    }},
-    {"type": "function", "function": {
-        "name": "edit_image", "description": "Change an existing image from this conversation.",
-        "parameters": {"type": "object", "properties": {
-            "image": {"type": "string", "description": "Label of the image to change, e.g. image_2."},
-            "prompt": {"type": "string", "description": "What to change."},
-        }, "required": ["image", "prompt"]},
-    }},
+SEARCH_NOTE = "To look something up on the web, call web_search."
+SEARCH_TODO = "TO BE IMPLEMENTED: web search isn't available yet. Answer without it and don't call it again."
+
+
+def spec(name: str, description: str, **properties) -> dict:
+    parameters = {"type": "object", "properties": properties, "required": list(properties)}
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
+
+
+IMAGE_SPECS = [
+    spec("generate_image", "Create a new image from a text description.",
+         prompt={"type": "string", "description": "What the image shows, in detail."}),
+    spec("edit_image", "Change an image from this conversation, or combine up to four into a new one.",
+         images={"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4,
+                 "description": 'Labels of the images, in order, e.g. ["image_2"].'},
+         prompt={"type": "string", "description": "What to change. Refer to the images by their order in images: "
+                                                  "the first image, the second image."}),
 ]
+SEARCH_SPEC = spec("web_search", "Search the web for current information.",
+                   query={"type": "string", "description": "What to search for."})
+KINDS = {"generate_image": ("image", "generate"), "edit_image": ("image", "edit"), "web_search": ("search", "search")}
+
+
+@dataclass
+class Call:
+    """One hub tool call, parsed once."""
+
+    id: str  # 32 random hex digits; Responses item ids and the generated image's file name use it
+    tool_call: dict  # the model's call: {"id", "type": "function", "function": {"name", "arguments"}}
+    kind: str  # "image" or "search"
+    action: str  # "generate", "edit" or "search"
+    text: str  # the prompt or the query; "" when the arguments don't give one
+    labels: list[str]  # edit: the image labels, in order; [] otherwise
 
 
 @dataclass
 class ToolContext:
     images: list[str]  # file names by label: image_1 is images[0]; each name appears once
-    base_url: str  # where browsers reach the gateway, ending in "/"
 
     def label(self, name: str) -> str:
         if name not in self.images:
             self.images.append(name)
         return f"image_{self.images.index(name) + 1}"
 
-    def url(self, name: str) -> str:
-        return self.base_url + FILES_PATH[1:] + name
-
 
 @dataclass
 class ToolOutput:
     content: str  # the tool message the model reads
-    display: str  # markdown added to the reply the user sees
     images: list[str]  # FileStore names this call produced, shown to the model after the round
 
 
@@ -65,7 +80,7 @@ class FileStore:
         self.folder = folder
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    def save(self, data: bytes) -> str:
+    def save(self, data: bytes, stem: str | None = None) -> str:
         if data.startswith(b"\x89PNG\r\n\x1a\n"):
             ext = "png"
         elif data.startswith(b"\xff\xd8\xff"):
@@ -74,7 +89,7 @@ class FileStore:
             ext = "webp"
         else:
             raise ValueError("unsupported image type")
-        name = f"{hashlib.sha256(data).hexdigest()[:32]}.{ext}"
+        name = f"{stem or hashlib.sha256(data).hexdigest()[:32]}.{ext}"
         path = self.folder / name
         if not path.exists():
             tmp = self.folder / f"{name}.tmp"
@@ -86,6 +101,9 @@ class FileStore:
     def path(self, name: str) -> Path | None:
         path = self.folder / name
         return path if FILE_NAME.match(name) and path.is_file() else None
+
+    def find(self, stem: str) -> str | None:
+        return next((f"{stem}.{ext}" for ext in MEDIA_TYPES if self.path(f"{stem}.{ext}")), None)
 
     def data_url(self, name: str) -> str:
         data = base64.b64encode(self.path(name).read_bytes()).decode()
@@ -102,41 +120,43 @@ class Tools:
     ):
         self.client, self.store, self.image_target, self.timeout = client, store, image_target, timeout
 
-    def specs(self) -> list[dict]:
-        return SPECS if self.image_target() else []
+    def offer(self) -> tuple[list[dict], str]:
+        if self.image_target():
+            return [*IMAGE_SPECS, SEARCH_SPEC], IMAGE_NOTE + "\n\n" + SEARCH_NOTE
+        return [SEARCH_SPEC], SEARCH_NOTE
 
-    def instructions(self) -> str:
-        return INSTRUCTIONS
-
-    def progress(self, name: str, arguments: str) -> str:
-        if name != "edit_image":
-            return "\n\n_generating image…_\n\n"
+    def call(self, tool_call: dict) -> Call:
+        function = tool_call["function"]
         try:
-            label = json.loads(arguments)["image"]
-        except (ValueError, TypeError, KeyError):
-            label = "an image"
-        return f"\n\n_editing {label}…_\n\n"
+            args = json.loads(function["arguments"])
+        except ValueError:
+            args = {}
+        args = args if isinstance(args, dict) else {}
+        text = args.get("prompt", args.get("query"))
+        labels = args.get("images") if function["name"] == "edit_image" else None
+        return Call(secrets.token_hex(16), tool_call, *KINDS[function["name"]], text if isinstance(text, str) else "",
+                    [str(label) for label in labels] if isinstance(labels, list) else [])
 
-    async def run(self, name: str, arguments: str, context: ToolContext) -> ToolOutput:
+    async def run(self, call: Call, context: ToolContext) -> ToolOutput:
+        if call.kind == "search":
+            raise ToolError(SEARCH_TODO)
         if not (target := self.image_target()):
             raise ToolError("no image deployment is running")
-        base, model = target
-        try:
-            args = json.loads(arguments)
-        except ValueError:
-            args = None
-        required = ("image", "prompt") if name == "edit_image" else ("prompt",)
-        if not isinstance(args, dict) or any(key not in args for key in required):
+        if not call.text:
             raise ToolError("invalid arguments")
-        fields = {"model": model, "prompt": args["prompt"], "n": 1, "response_format": "b64_json"}
-        if name == "edit_image":
-            match = re.fullmatch(r"image_([1-9][0-9]*)", str(args["image"]))
-            if not match or int(match[1]) > len(context.images):
-                raise ToolError(f"unknown image {args['image']}")
-            file = context.images[int(match[1]) - 1]
-            image = (file, self.store.path(file).read_bytes(), MEDIA_TYPES[file.split(".")[1]])
-            request = {"url": f"{base}/images/edits", "data": {k: str(v) for k, v in fields.items()},
-                       "files": {"image": image}}
+        base, model = target
+        fields = {"model": model, "prompt": call.text, "n": 1, "response_format": "b64_json"}
+        if call.action == "edit":
+            if not 1 <= len(call.labels) <= 4:
+                raise ToolError("edit_image takes one to four images")
+            images = []
+            for label in call.labels:
+                match = re.fullmatch(r"image_([1-9][0-9]*)", label)
+                if not match or int(match[1]) > len(context.images):
+                    raise ToolError(f"unknown image {label}")
+                file = context.images[int(match[1]) - 1]
+                images.append(("image", (file, self.store.path(file).read_bytes(), MEDIA_TYPES[file.split(".")[1]])))
+            request = {"url": f"{base}/images/edits", "data": {k: str(v) for k, v in fields.items()}, "files": images}
         else:
             request = {"url": f"{base}/images/generations", "json": fields}
         try:
@@ -144,11 +164,9 @@ class Tools:
         except httpx.RequestError as error:
             raise ToolError(f"image server: {str(error) or type(error).__name__}")
         if not response.is_success:
-            raise ToolError(f"image server returned HTTP {response.status_code}")
+            raise ToolError(f"image server returned HTTP {response.status_code}: {response.text[:200]}")
         try:
-            name = self.store.save(base64.b64decode(response.json()["data"][0]["b64_json"], validate=True))
+            name = self.store.save(base64.b64decode(response.json()["data"][0]["b64_json"], validate=True), call.id)
         except (ValueError, KeyError, IndexError, TypeError):
             raise ToolError("image server returned no image")
-        label = context.label(name)
-        return ToolOutput(f"{label} is shown to the user and attached below", f"![{label}]({context.url(name)})\n\n",
-                          [name])
+        return ToolOutput(f"{context.label(name)} is shown to the user and attached below", [name])

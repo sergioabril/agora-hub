@@ -1,7 +1,7 @@
 import asyncio
 import base64
-import hashlib
 import json
+import re
 
 import httpx
 import pytest
@@ -9,26 +9,19 @@ import pytest
 from agora_hub.config import DeploymentConfig, load_config
 from agora_hub.controller import Controller
 from agora_hub.gateway import create_gateway
-from agora_hub.tools import FileStore
+from agora_hub.harness import SHOWN, Delta, Failed, Finished, Harness, ToolFinished, ToolStarted, UpstreamError
+from agora_hub.tools import IMAGE_NOTE, SEARCH_NOTE, FileStore, Tools
 from tests.fakes import FakeAdapters
 
 KEY = {"Authorization": "Bearer " + "b" * 64}
 SSE = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
-NAME = hashlib.sha256(PNG).hexdigest()[:32] + ".png"
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
-SHOWN = {"type": "text", "text": "Images shown above, attached so you can see them:"}
-GENERATING = "\n\n_generating image…_\n\n"
-LOOKUP = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+JPG = b"\xff\xd8\xff" + b"j" * 16
+JPG_URL = "data:image/jpeg;base64," + base64.b64encode(JPG).decode()
 
 
-@pytest.fixture
-def gateway(config_dir):
-    config = load_config(config_dir)
-    adapters = FakeAdapters()
-    controller = Controller(config, adapters)
-    requests, replies = [], []
-
+def upstream(requests, replies):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if "/images/" in request.url.path:
@@ -39,8 +32,25 @@ def gateway(config_dir):
             return httpx.Response(200, content=SSE, headers={"content-type": "text/event-stream"})
         return httpx.Response(200, json={"ok": True})
 
-    app = create_gateway(config, controller, httpx.MockTransport(handler))
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def gateway(config_dir):
+    config = load_config(config_dir)
+    adapters = FakeAdapters()
+    controller = Controller(config, adapters)
+    requests, replies = [], []
+    app = create_gateway(config, controller, upstream(requests, replies))
     return config, adapters, controller, app, requests, replies
+
+
+@pytest.fixture
+def harness(tmp_path):
+    requests, replies, image = [], [], [("http://img.local/v1", "img")]  # clear image to stop the image server
+    http = httpx.AsyncClient(transport=upstream(requests, replies))
+    store = FileStore(tmp_path / "files")
+    return Harness(http, Tools(http, store, lambda: image[0] if image else None, 60), store), store, requests, replies, image
 
 
 def client(app):
@@ -51,10 +61,6 @@ async def serve(adapters, controller, image=True):
     adapters.readiness.update(pro=True, images=image)
     adapters.models.update(pro=["m1"], images=["img"])
     await controller.deployments_status()
-
-
-def call(name, arguments, call_id="call_1"):
-    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
 
 
 def completion(content=None, calls=None):
@@ -72,20 +78,12 @@ def sse(*deltas, finish="stop", joined=False):  # joined: finish_reason on the l
     return httpx.Response(200, content=body + "data: [DONE]\n\n", headers={"content-type": "text/event-stream"})
 
 
-def deltas(text):
-    return [json.loads(line[6:])["choices"][0]["delta"] for line in text.split("\n\n") if line.startswith("data: {")]
-
-
 def chats(requests):
     return [json.loads(r.content) for r in requests if r.url.path.endswith("/chat/completions")]
 
 
 def ask(request, messages, **body):
     return request.post("/openai/v1/chat/completions", json={"model": "agora", "messages": messages, **body}, headers=KEY)
-
-
-def stream_calls(*calls):
-    return [{"tool_calls": [{"index": index, **call}]} for index, call in enumerate(calls)]
 
 
 async def test_auth_and_models(gateway):
@@ -135,127 +133,240 @@ async def test_routing(gateway):
     assert all("authorization" not in r.headers for r in requests)
 
 
-async def test_disconnect(gateway):
+@pytest.mark.parametrize("path, body", [("/openai/v1/chat/completions", {"messages": [{"role": "user", "content": "fox"}]}),
+                                        ("/openai/v1/responses", {"input": "fox", "stream": True})])
+async def test_disconnect(gateway, path, body):
     _, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
+
+    finished = []
 
     async def slow():  # MockTransport awaits a coroutine reply
         await asyncio.sleep(0.5)
-        return completion(calls=[call("generate_image", {"prompt": "fox"})])
+        finished.append(True)
+        return completion("late")
     replies.append(slow())
-    body = json.dumps({"model": "agora", "messages": [{"role": "user", "content": "fox"}]}).encode()
+    body = json.dumps({"model": "agora", **body}).encode()
     received, sent = asyncio.Queue(), asyncio.Queue()
     for message in ({"type": "http.request", "body": body}, {"type": "http.disconnect"}):
         received.put_nowait(message)
-    scope = {"type": "http", "method": "POST", "path": "/openai/v1/chat/completions", "query_string": b"",
+    scope = {"type": "http", "method": "POST", "path": path, "query_string": b"",
              "headers": [(b"authorization", KEY["Authorization"].encode())]}
     await app(scope, received.get, sent.put)
-    assert sent.get_nowait()["status"] == 499 and len(chats(requests)) == 1 and not any("/images/" in r.url.path for r in requests)
+    assert sent.get_nowait()["status"] == 499 and len(chats(requests)) == 1
+    assert not any("/images/" in r.url.path for r in requests)
+    await asyncio.sleep(0.6)
+    assert not finished
 
 
-async def test_chat_generate(gateway):
-    config, adapters, controller, app, requests, replies = gateway
+async def test_chat_passthrough(gateway):
+    _, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
-    replies += [completion(calls=[call("generate_image", {"prompt": "a red fox"})]), completion("A fox.")]
+    content = [{"type": "text", "text": "what is this?"}, {"type": "image_url", "image_url": {"url": PNG_URL}},
+               {"type": "image_url", "image_url": {"url": "https://x.org/a.png"}}]
+    messages = [{"role": "user", "content": content}]
+    streamed = sse({"role": "assistant", "content": "A"}, {"content": " fox."})
+    replies += [completion("A fox."), streamed, httpx.Response(400, json={"error": {"message": "too long"}})]
     async with client(app) as request:
-        reply = await ask(request, [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "fox"}])
-        image = await request.get(f"/files/{NAME}")
-        missing = await request.get("/files/0000.png")
-    url = f"http://test/files/{NAME}"
-    assert reply.json()["choices"][0]["message"]["content"] == f"{GENERATING}![image_1]({url})\n\nA fox."
-    assert image.content == PNG and image.headers["content-type"] == "image/png"
-    assert image.headers["cache-control"] == "public, max-age=31536000, immutable"
-    assert missing.status_code == 404 and missing.json()["error"]["code"] == "file_not_found"
-    assert str(requests[1].url) == "http://spark-4.local:8001/v1/images/generations"
-    assert json.loads(requests[1].content) == {"model": "img", "prompt": "a red fox", "n": 1, "response_format": "b64_json"}
+        plain = await ask(request, messages, temperature=0.2)
+        stream = await ask(request, messages, stream=True)
+        error = await ask(request, messages)
+    assert chats(requests)[0] == {"model": "m1", "messages": messages, "temperature": 0.2}
+    assert plain.json() == completion("A fox.").json()
+    assert stream.content == streamed.content and stream.headers["content-type"].startswith("text/event-stream")
+    assert stream.headers["cache-control"] == "no-cache" and stream.headers["x-accel-buffering"] == "no"
+    assert error.status_code == 400 and error.json() == {"error": {"message": "too long"}}
+
+
+async def test_trace(gateway, capsys):
+    _, adapters, controller, app, _, replies = gateway
+    await serve(adapters, controller)
+    replies.append(sse({"role": "assistant", "content": "A"}, {"content": " fox."}))
+    messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": PNG_URL}}]}]
+    async with client(app) as request:
+        await ask(request, messages, stream=True)
+        await ask(request, messages, model="nope")
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    first = lines[0]["request"]
+    assert re.fullmatch(r"chat_[0-9a-f]{16}", first)
+    assert [(line["event"], line["request"] == first) for line in lines[:3]] == [
+        ("request", True), ("upstream.request", True), ("upstream.response", True)]
+    url = lines[0]["body"]["messages"][0]["content"][0]["image_url"]["url"]
+    assert url == f"data:image/png;base64,<{len(PNG_URL)} chars>"
+    assert lines[2]["message"]["content"] == "A fox." and lines[2]["message"]["finish_reason"] == "stop"
+    assert lines[-1]["event"] == "error" and lines[-1]["code"] == "model_not_found" and lines[-1]["request"] != first
+
+
+def tool_call(name, **arguments):
+    return {"tool_calls": [{"index": 0, "id": f"call_{name}", "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
+
+async def turn(harness, messages, **body):
+    started = await harness.start({"model": "m1", "messages": messages, **body}, "http://llm.local/v1/chat/completions",
+                                  "resp_test")
+    return [event async for event in harness.events(started)]
+
+
+async def test_harness_generate(harness):
+    harness, store, requests, replies, _ = harness
+    replies += [sse({"reasoning_content": "fox?"}, {"content": "Sure."}, tool_call("generate_image", prompt="a red fox"),
+                    finish="tool_calls", joined=True), sse({"content": "Done."})]
+    events = await turn(harness, [{"role": "user", "content": "draw a red fox"}])
+    call = events[2].call
+    assert (call.kind, call.action, call.text, call.labels) == ("image", "generate", "a red fox", [])
+    assert events == [Delta("", "fox?"), Delta("Sure.", ""), ToolStarted(call),
+                      ToolFinished(call, events[3].output, None), Delta("Done.", ""), Finished([], "stop")]
+    assert events[3].output.images == [f"{call.id}.png"]
     first, second = chats(requests)
-    assert first["model"] == "m1" and [t["function"]["name"] for t in first["tools"]] == ["generate_image", "edit_image"]
-    assert first["messages"][0]["content"].startswith("Be brief.\n\nImages in this conversation are labelled")
-    assert second["messages"][-3]["tool_calls"][0]["id"] == "call_1"
-    assert second["messages"][-2] == {"role": "tool", "tool_call_id": "call_1",
-                                      "content": "image_1 is shown to the user and attached below"}
-    assert second["messages"][-1] == {"role": "user", "content": [
-        SHOWN, {"type": "text", "text": "[image_1]"}, {"type": "image_url", "image_url": {"url": PNG_URL}}]}
-    assert (config.config_dir / "files" / NAME).stat().st_mode & 0o777 == 0o600
+    assert all(body["stream"] and body["stream_options"] == {"include_usage": True} for body in (first, second))
+    assert [tool["function"]["name"] for tool in first["tools"]] == ["generate_image", "edit_image", "web_search"]
+    assert first["messages"][0] == {"role": "system", "content": IMAGE_NOTE + "\n\n" + SEARCH_NOTE}
+    assistant, tool, shown = second["messages"][-3:]
+    assert assistant["tool_calls"][0]["function"]["name"] == "generate_image" and assistant["content"] == "Sure."
+    assert tool == {"role": "tool", "tool_call_id": "call_generate_image",
+                    "content": "image_1 is shown to the user and attached below"}
+    assert shown["content"] == [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_1]"},
+                                {"type": "image_url", "image_url": {"url": PNG_URL}}]
+    assert store.path(f"{call.id}.png").stat().st_mode & 0o777 == 0o600
 
 
-async def test_chat_generate_streaming(gateway):
-    _, adapters, controller, app, requests, replies = gateway
+async def test_harness_history_and_edit(harness):
+    harness, store, requests, replies, _ = harness
+    linked = store.save(PNG)
+    lookup = {"id": "c9", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": JPG_URL}}]},
+        {"role": "assistant", "content": f"Here ![x](/files/{linked})", "tool_calls": [lookup]},
+        {"role": "tool", "tool_call_id": "c9", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "combine"}, {"type": "image_url", "image_url": {"url": JPG_URL}},
+                                     {"type": "image_url", "image_url": {"url": "https://x.org/a.png"}}]}]
+    replies.append(sse(tool_call("edit_image", images=["image_1", "image_2"], prompt="combine them"), finish="tool_calls"))
+    await turn(harness, messages)
+    sent = chats(requests)[0]["messages"]
+    assert sent[1]["content"] == [{"type": "text", "text": "look"}, {"type": "text", "text": "[image_1]"},
+                                  {"type": "image_url", "image_url": {"url": JPG_URL}}]
+    assert sent[2]["content"] == "Here [image_2]" and sent[3]["role"] == "tool"
+    assert sent[4]["content"] == [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_2]"},
+                                  {"type": "image_url", "image_url": {"url": PNG_URL}}]
+    assert sent[5]["content"] == [{"type": "text", "text": "combine"}, {"type": "text", "text": "[image_1]"},
+                                  {"type": "text", "text": "[image unavailable]"}]
+    edit = next(r for r in requests if r.url.path.endswith("/images/edits")).content
+    assert edit.count(b'name="image"; filename=') == 2 and edit.index(JPG) < edit.index(PNG)
+
+
+async def test_harness_tools_and_errors(harness, capsys):
+    harness, _, requests, replies, image = harness
+    user = [{"role": "user", "content": "hi"}]
+    replies += [sse(tool_call("web_search", query="news"), finish="tool_calls"), sse({"content": "No search."})]
+    searched = await turn(harness, user)
+    assert searched[1].call.text == "news" and searched[1].error.startswith("TO BE IMPLEMENTED: web search")
+    assert chats(requests)[-1]["messages"][-1]["content"] == "error: " + searched[1].error
+    lookup = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    replies.append(sse(tool_call("lookup", q="x"), finish="tool_calls"))
+    assert (await turn(harness, user, tools=[lookup]))[-1] == Finished([
+        {"id": "call_lookup", "type": "function", "function": {"name": "lookup", "arguments": '{"q": "x"}'}}], "tool_calls")
+    replies.append(httpx.Response(400, json={"error": {"message": "too long"}}))
+    with pytest.raises(UpstreamError) as error:
+        await turn(harness, user)
+    assert (error.value.status, error.value.message) == (400, "too long")
+    replies += [sse(tool_call("generate_image", prompt="fox"), finish="tool_calls"), httpx.Response(500, text="boom")]
+    assert (await turn(harness, user))[-1] == Failed("upstream returned HTTP 500")
+    image.clear()
+    replies.append(sse({"content": "ok"}))
+    await turn(harness, user)
+    assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["web_search"]
+    events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
+    assert events.count("tool.call") == events.count("tool.result") == 2
+
+
+def respond(request, **body):
+    return request.post("/openai/v1/responses", json={"model": "agora", **body}, headers=KEY)
+
+
+def sse_events(text):
+    return [json.loads(block.split("\ndata: ", 1)[1]) for block in text.split("\n\n") if block.startswith("event:")]
+
+
+async def test_responses_stream(gateway):
+    _, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
-    replies += [
-        sse({"role": "assistant", "content": "Sure."}, *stream_calls(call("generate_image", {"prompt": "fox"})),
-            finish="tool_calls"),
-        sse({"content": "Done."}),
-    ]
+    replies += [sse({"reasoning_content": "fox?"}, {"content": "Sure."}, tool_call("generate_image", prompt="a red fox"),
+                    finish="tool_calls", joined=True), sse({"content": "Done."})]
     async with client(app) as request:
-        reply = await ask(request, [{"role": "user", "content": "fox"}], stream=True)
-    assert "tool_calls" not in reply.text and reply.text.endswith("data: [DONE]\n\n")
-    image = f"![image_1](http://test/files/{NAME})\n\n"
-    assert [d.get("content") for d in deltas(reply.text)] == ["Sure.", GENERATING, image, "Done.", None]
-    assert chats(requests)[1]["messages"][-3]["content"] == "Sure."
-    assert chats(requests)[1]["messages"][-1]["content"][2] == {"type": "image_url", "image_url": {"url": PNG_URL}}
+        reply = await respond(request, input="draw a red fox", stream=True)
+    events = sse_events(reply.text)
+    text = ["output_item.added", "content_part.added", "output_text.delta", "output_text.done", "content_part.done",
+            "output_item.done"]
+    assert [e["type"] for e in events] == ["response." + kind for kind in [
+        "created", "in_progress", *[kind.replace("output_text", "reasoning_text") for kind in text], *text,
+        "output_item.added", "image_generation_call.in_progress", "image_generation_call.generating",
+        "image_generation_call.completed", "output_item.done", *text, "completed"]]
+    assert [e["sequence_number"] for e in events] == list(range(len(events)))
+    added, done = events[14]["item"], events[18]["item"]
+    assert re.fullmatch(r"ig_[0-9a-f]{32}", added["id"]) and (added["action"], added["revised_prompt"]) == ("generate", "a red fox")
+    assert (done["status"], done["result"], done["output_format"]) == ("completed", base64.b64encode(PNG).decode(), "png")
+    final = events[-1]["response"]
+    assert [item["type"] for item in final["output"]] == ["reasoning", "message", "image_generation_call", "message"]
+    assert final["model"] == "m1" and final["status"] == "completed"
 
 
-async def test_chat_history_and_edit(gateway):
+async def test_responses_input(gateway):
     config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
-    other = FileStore(config.config_dir / "files").save(PNG[:8] + b"y" * 16)
-    other_url = "data:image/png;base64," + base64.b64encode(PNG[:8] + b"y" * 16).decode()
-    data_url = {"type": "image_url", "image_url": {"url": PNG_URL}}
-    messages = [
-        {"role": "user", "content": [{"type": "text", "text": "make it blue"}, data_url]},
-        {"role": "assistant", "content": f"Here ![image_1](http://elsewhere:8888/files/{other})",
-         "tool_calls": [call("lookup", {}, "call_9")]},
-        {"role": "tool", "tool_call_id": "call_9", "content": "found"},
-        {"role": "user", "content": [data_url, {"type": "image_url", "image_url": {"url": "https://x.org/a.png"}}]},
-    ]
-    replies += [completion(calls=[call("edit_image", {"image": "image_1", "prompt": "blue"})]), completion("Done.")]
+    stem = "a" * 32
+    FileStore(config.config_dir / "files").save(PNG, stem)
+    lookup = {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+    items = [{"role": "developer", "content": "Be kind."},
+             {"role": "user", "content": [{"type": "input_text", "text": "look"}, {"type": "input_image", "image_url": JPG_URL}]},
+             {"type": "reasoning", "id": "rs_1", "summary": []},
+             {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Drawing."}]},
+             {"type": "image_generation_call", "id": f"ig_{stem}", "status": "completed", "result": None},
+             {"type": "function_call", "call_id": "c1", "name": "lookup", "arguments": "{}"},
+             {"type": "function_call_output", "call_id": "c1", "output": "ok"}]
     async with client(app) as request:
-        reply = await ask(request, messages)
-    first = chats(requests)[0]
-    assert first["messages"][1]["content"] == [{"type": "text", "text": "make it blue"}, {"type": "text", "text": "[image_1]"}, data_url]
-    assert first["messages"][2]["content"] == "Here [image_2]" and first["messages"][3]["role"] == "tool"
-    assert first["messages"][4] == {"role": "user", "content": [
-        SHOWN, {"type": "text", "text": "[image_2]"}, {"type": "image_url", "image_url": {"url": other_url}}]}
-    assert first["messages"][5]["content"] == [{"type": "text", "text": "[image_1]"}, {"type": "text", "text": "[image unavailable]"}]
-    edit = requests[1]
-    assert str(edit.url) == "http://spark-4.local:8001/v1/images/edits"
-    assert edit.headers["content-type"].startswith("multipart/form-data")
-    assert PNG in edit.content and f'filename="{NAME}"'.encode() in edit.content and b"image/png" in edit.content
-    assert "_editing image_1…_" in reply.json()["choices"][0]["message"]["content"]
+        reply = await respond(request, instructions="Be brief.", input=items, max_output_tokens=50,
+                              tools=[lookup, {"type": "image_generation"}, {"type": "web_search"}],
+                              tool_choice={"type": "function", "name": "lookup"})
+        errors = [await respond(request, **{"input": "hi", **extra}) for extra in (
+            {"previous_response_id": "resp_1"}, {"tools": [{"type": "file_search"}]},
+            {"input": [{"type": "item_reference", "id": "x"}]})]
+    sent = chats(requests)[0]
+    assert reply.status_code == 200 and len(chats(requests)) == 1
+    assert sent["messages"] == [
+        {"role": "system", "content": "Be brief.\n\n" + IMAGE_NOTE + "\n\n" + SEARCH_NOTE},
+        {"role": "system", "content": "Be kind."},
+        {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "text", "text": "[image_1]"},
+                                     {"type": "image_url", "image_url": {"url": JPG_URL}}]},
+        {"role": "assistant", "content": "Drawing.\n\n[image_2]",
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_2]"},
+                                     {"type": "image_url", "image_url": {"url": PNG_URL}}]}]
+    assert sent["tools"][0] == {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+    assert [tool["function"]["name"] for tool in sent["tools"]] == ["lookup", "generate_image", "edit_image", "web_search"]
+    assert sent["tool_choice"] == {"type": "function", "function": {"name": "lookup"}} and sent["max_tokens"] == 50
+    assert [(r.status_code, r.json()["error"]["code"]) for r in errors] == [
+        (400, "unsupported_parameter"), (400, "unsupported_tool"), (400, "invalid_request")]
 
 
-async def test_chat_client_tools(gateway):
-    _, adapters, controller, app, requests, replies = gateway
+async def test_responses_items(gateway, capsys):
+    _, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
-    messages = [{"role": "user", "content": "go"}]
-    lookup = call("lookup", {}, "call_2")
-    replies += [
-        completion(calls=[lookup]),
-        sse(*stream_calls(call("generate_image", {"prompt": "x"}), lookup), finish="tool_calls", joined=True),
-    ]
+    lookup = {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+    replies += [sse(tool_call("web_search", query="news"), finish="tool_calls"), sse({"content": "No search."}),
+                sse(tool_call("lookup", q="x"), finish="tool_calls"), sse({"content": "Cut"}, finish="length"),
+                sse(tool_call("generate_image", prompt="fox"), finish="tool_calls"), httpx.Response(500, text="boom")]
     async with client(app) as request:
-        only = await ask(request, messages, tools=[LOOKUP])
-        mixed = await ask(request, messages, tools=[LOOKUP], stream=True)
-        await serve(adapters, controller, image=False)
-        await ask(request, messages, tools=[LOOKUP])
-    assert only.json()["choices"][0]["message"]["tool_calls"] == [lookup]
-    assert [r.url.path for r in requests].count("/v1/images/generations") == 1
-    sent = deltas(mixed.text)
-    assert [d["tool_calls"] for d in sent if "tool_calls" in d] == [[{"index": 0, **lookup}]]
-    assert f"![image_1](http://test/files/{NAME})\n\n" in [d.get("content") for d in sent]
-    assert mixed.text.count('"finish_reason": "tool_calls"') == 1 and len(chats(requests)) == 3
-    last = chats(requests)[-1]
-    assert last["tools"] == [LOOKUP] and last["messages"] == messages
-
-
-async def test_chat_public_host(gateway):
-    config, adapters, controller, app, _, replies = gateway
-    config.hub.gateway.public_host = "100.64.1.2"
-    await serve(adapters, controller)
-    replies += [completion(calls=[call("generate_image", {"prompt": "x"})]), completion("ok")]
-    async with client(app) as request:
-        reply = await ask(request, [{"role": "user", "content": "fox"}])
-    content = reply.json()["choices"][0]["message"]["content"]
-    assert f"![image_1](http://100.64.1.2:8888/files/{NAME})" in content
-    assert (await controller.deployments_status())["gateway"]["host"] == "100.64.1.2"
+        searched, called, cut, failed = [(await respond(request, input="hi", **extra)).json()
+                                         for extra in ({}, {"tools": [lookup]}, {}, {})]
+    assert [item["type"] for item in searched["output"]] == ["web_search_call", "message"]
+    assert searched["output"][0]["status"] == "failed" and searched["output"][0]["action"]["query"] == "news"
+    call = called["output"][-1]
+    assert (call["type"], call["call_id"], call["name"], call["arguments"]) == ("function_call", "call_lookup", "lookup",
+                                                                                '{"q": "x"}')
+    assert cut["status"] == "incomplete" and cut["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert failed["status"] == "failed" and failed["error"] == {"code": "server_error", "message": "upstream returned HTTP 500"}
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["request"] for line in lines if line["event"] == "response"] == [searched["id"], called["id"], cut["id"], failed["id"]]
+    assert re.fullmatch(r"resp_[0-9a-f]{32}", searched["id"])

@@ -5,12 +5,14 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
 from .controller import Controller
-from .harness import BadRequest, Harness, UpstreamDown
-from .tools import MEDIA_TYPES, FileStore, Tools
+from .harness import Harness, Message, UpstreamDown, UpstreamError, error_text
+from .responses import BadRequest, respond
+from .tools import FileStore, Tools
+from .trace import trace
 
 
 class GatewayError(Exception):
@@ -65,7 +67,8 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
     router = APIRouter(dependencies=[Depends(authenticate)])
 
     @app.exception_handler(GatewayError)
-    async def gateway_error(_request, error: GatewayError):
+    async def gateway_error(request: Request, error: GatewayError):
+        trace(getattr(request.state, "trace", None), "error", status=error.status, code=error.code, message=error.message)
         kind = "invalid_request_error" if error.status < 500 else "server_error"
         content = {"error": {"message": error.message, "type": kind, "code": error.code}}
         return JSONResponse(content, error.status, error.headers)
@@ -78,40 +81,89 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
             data += [{"id": model_id, "object": "model", "created": 0, "owned_by": deployment_id} for model_id in ids]
         return {"object": "list", "data": data}
 
-    @router.post("/openai/v1/chat/completions")
-    async def chat(request: Request):
-        body = await parse(request)
-        deployment_id, body["model"] = resolve(body["model"])
-        deployment, gateway = config.deployments[deployment_id], config.hub.gateway
-        base_url = f"http://{gateway.public_host}:{gateway.port}/" if gateway.public_host else str(request.base_url)
-        url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
-        # FastAPI would run a non-streaming turn to the end after the client left: race it against the disconnect.
-        turn = asyncio.ensure_future(harness.chat(body, url, base_url))
-        gone = asyncio.ensure_future(request.receive())
-        await asyncio.wait({turn, gone}, return_when=asyncio.FIRST_COMPLETED)
-        if not turn.done():
-            turn.cancel()
-            await asyncio.gather(turn, return_exceptions=True)
+    async def race(request: Request, work, name: str) -> Response:
+        """FastAPI would run a non-streaming turn to the end after the client left: race it against the disconnect."""
+        task, gone = asyncio.ensure_future(work), asyncio.ensure_future(request.receive())
+        await asyncio.wait({task, gone}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            trace(request.state.trace, "disconnect")
             return Response(status_code=499)  # never delivered: the client has gone
         gone.cancel()
         try:
-            return turn.result()
+            return task.result()
         except BadRequest as error:
-            raise GatewayError(400, "invalid_request", str(error))
+            raise GatewayError(400, error.code, error.message)
         except UpstreamDown as error:
-            raise GatewayError(502, "upstream_unavailable", f"{deployment.name}: {error}")
+            raise GatewayError(502, "upstream_unavailable", f"{name}: {error}")
+        except UpstreamError as error:
+            raise GatewayError(error.status, "upstream_error", f"{name}: {error.message}")
+
+    async def relay(upstream: httpx.Response, request_id: str):
+        message = Message()
+        try:
+            async for line in upstream.aiter_lines():
+                if line.startswith("data:") and (data := line[5:].strip()) != "[DONE]":
+                    try:
+                        message.add(json.loads(data))
+                    except ValueError:
+                        pass
+                yield line + "\n"
+            trace(request_id, "upstream.response", status=upstream.status_code, message=message.summary())
+        except httpx.HTTPError as error:
+            trace(request_id, "upstream.error", error=error_text(error))
+        except (asyncio.CancelledError, GeneratorExit):
+            trace(request_id, "disconnect", message=message.summary())
+            raise
+        finally:
+            await upstream.aclose()
+
+    async def forward(body: dict, url: str, name: str, request_id: str) -> Response:
+        trace(request_id, "upstream.request", url=url, body=body)
+        try:
+            upstream = await client.send(client.build_request("POST", url, json=body), stream=True)
+            content_type = upstream.headers.get("content-type", "")
+            if not content_type.startswith("text/event-stream"):
+                await upstream.aread()
+        except httpx.RequestError as error:
+            trace(request_id, "upstream.error", error=error_text(error))
+            raise GatewayError(502, "upstream_unavailable", f"{name}: {error_text(error)}")
+        if content_type.startswith("text/event-stream"):
+            headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+            return StreamingResponse(relay(upstream, request_id), upstream.status_code, headers, content_type)
+        try:
+            logged = upstream.json()
+        except ValueError:
+            logged = upstream.text
+        trace(request_id, "upstream.response", status=upstream.status_code, body=logged)
+        return Response(upstream.content, upstream.status_code, media_type=content_type or None)
+
+    @router.post("/openai/v1/chat/completions")
+    async def chat(request: Request):
+        body = await parse(request)
+        request_id = request.state.trace = f"chat_{secrets.token_hex(8)}"
+        trace(request_id, "request", endpoint="chat/completions", body=body)
+        deployment_id, model = resolve(body["model"])
+        deployment = config.deployments[deployment_id]
+        url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
+        return await race(request, forward({**body, "model": model}, url, deployment.name, request_id), deployment.name)
+
+    @router.post("/openai/v1/responses")
+    async def responses(request: Request):
+        body = await parse(request)
+        request_id = request.state.trace = f"resp_{secrets.token_hex(16)}"
+        trace(request_id, "request", endpoint="responses", body=body)
+        deployment_id, model = resolve(body["model"])
+        deployment = config.deployments[deployment_id]
+        url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
+        work = respond(harness, files, {**body, "model": model}, url, request_id)
+        return await race(request, work, deployment.name)
 
     @router.api_route("/openai/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
     async def not_served(path: str, request: Request):
-        raise GatewayError(404, "not_found", f"{request.method} /openai/v1/{path} is not served; the gateway serves "
-                                             "GET /openai/v1/models and POST /openai/v1/chat/completions")
-
-    @app.get("/files/{name}")
-    async def file(name: str):
-        if not (path := files.path(name)):
-            raise GatewayError(404, "file_not_found", f"file {name} not found")
-        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
-        return FileResponse(path, media_type=MEDIA_TYPES[path.suffix[1:]], headers=headers)
+        served = "GET /openai/v1/models, POST /openai/v1/chat/completions and POST /openai/v1/responses"
+        raise GatewayError(404, "not_found", f"{request.method} /openai/v1/{path} is not served; the gateway serves {served}")
 
     app.include_router(router)
     return app
