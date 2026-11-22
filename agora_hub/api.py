@@ -6,9 +6,10 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
-from .config import Config, ConfigError, parse_machine, save_deployment, save_machine
+from .accounts import Accounts
+from .config import Config, ConfigError, Name, parse_machine, save_deployment, save_machine
 from .controller import Conflict, Controller
 from .home_assistant import HomeAssistant
 from .integrations import home_assistant_router
@@ -23,7 +24,15 @@ class DeploymentAction(BaseModel):
     action: Literal["start", "stop"]
 
 
-def create_app(config: Config, controller: Controller, home_assistant: HomeAssistant) -> FastAPI:
+class NewAccount(BaseModel):
+    name: Name
+
+
+class DisableAccount(BaseModel):
+    disabled: StrictBool
+
+
+def create_app(config: Config, controller: Controller, home_assistant: HomeAssistant, accounts: Accounts) -> FastAPI:
     async def authenticate(authorization: Annotated[str | None, Header()] = None):
         token = config.hub.api.admin_token
         if token is None:
@@ -134,6 +143,35 @@ def create_app(config: Config, controller: Controller, home_assistant: HomeAssis
         if deployment_id not in controller.deployment_operations:
             raise HTTPException(404, "No operation")
         return stream(deployment_id, 200)
+
+    def account(user_id: str) -> dict:
+        if (user := accounts.get(user_id)) is None:
+            raise HTTPException(404, "Account not found")
+        return user
+
+    @app.get("/admin/accounts")
+    async def list_accounts():
+        return {"accounts": accounts.users()}
+
+    @app.post("/admin/accounts/new", status_code=201)
+    async def new_account(body: NewAccount):
+        return accounts.add(body.name)
+
+    @app.post("/admin/accounts/{user_id}/disable")
+    async def disable_account(user_id: str, body: DisableAccount):
+        account(user_id)
+        return accounts.disable(user_id, body.disabled)
+
+    @app.post("/admin/accounts/{user_id}/invite", status_code=201)
+    async def invite_account(user_id: str):
+        if account(user_id)["disabled"]:
+            raise HTTPException(409, "Account is disabled")
+        return accounts.invite(user_id)
+
+    @app.post("/admin/accounts/{user_id}/revoke")
+    async def revoke_account(user_id: str):
+        account(user_id)
+        return {"revoked": accounts.revoke(user_id)}
 
     app.include_router(home_assistant_router(config, home_assistant))
     return app

@@ -41,15 +41,7 @@ class APIConfig(Model):
 
 class GatewayConfig(Model):
     port: int = Field(default=8888, ge=1, le=65535)
-    api_keys: list[SecretStr] = Field(default=[], repr=False)
     public_host: HostName | None = None
-
-    @field_validator("api_keys")
-    @classmethod
-    def hex_keys(cls, value: list[SecretStr]) -> list[SecretStr]:
-        if any(not re.fullmatch(r"[0-9a-fA-F]{64}", key.get_secret_value()) for key in value):
-            raise ValueError("each key must contain 64 hex characters")
-        return value
 
 
 class SSHConfig(Model):

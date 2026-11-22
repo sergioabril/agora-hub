@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import re
 
@@ -6,6 +7,7 @@ import httpx
 import yaml
 import pytest
 
+from agora_hub.accounts import Accounts
 from agora_hub.adapters import AdapterError
 from agora_hub.api import create_app
 from agora_hub.config import load_config
@@ -24,7 +26,7 @@ def api(config_dir):
     config.hub.timeouts.readiness_poll_seconds = 0.001
     adapters = FakeAdapters()
     controller = Controller(config, adapters)
-    app = create_app(config, controller, HomeAssistant(config))
+    app = create_app(config, controller, HomeAssistant(config), Accounts(config_dir / "agora.db"))
     headers = {"Authorization": "Bearer " + "a" * 64}
     return config, adapters, controller, app, headers
 
@@ -33,7 +35,7 @@ def client(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_auth_precedes_validation_and_only_fifteen_routes(api):
+async def test_auth_precedes_validation_and_only_twenty_routes(api):
     _, _, _, app, headers = api
     async with client(app) as request:
         missing = await request.post("/admin/machines/spark-1", json={"action": "bad"})
@@ -46,7 +48,7 @@ async def test_auth_precedes_validation_and_only_fifteen_routes(api):
     assert all(response.status_code == 404 for response in hidden)
     included = [route for item in app.routes if hasattr(item, "original_router") for route in item.original_router.routes]
     paths = [getattr(route, "path", "") for route in [*app.routes, *included]]
-    assert len([path for path in paths if path.startswith("/admin")]) == 15
+    assert len([path for path in paths if path.startswith("/admin")]) == 20
 
 
 async def test_empty_admin_token_disables_auth(config_dir):
@@ -55,7 +57,7 @@ async def test_empty_admin_token_disables_auth(config_dir):
     hub["api"]["admin_token"] = ""
     path.write_text(yaml.safe_dump(hub))
     config = load_config(config_dir)
-    app = create_app(config, Controller(config, FakeAdapters()), HomeAssistant(config))
+    app = create_app(config, Controller(config, FakeAdapters()), HomeAssistant(config), Accounts(config_dir / "agora.db"))
     async with client(app) as request:
         none = await request.get("/admin/deployments/status")
         anything = await request.get("/admin/deployments/status", headers={"Authorization": "Bearer whatever"})
@@ -203,7 +205,7 @@ async def test_new_controller_has_no_operation_memory(api):
     await controller.task
     fresh_adapters = FakeAdapters()
     fresh = Controller(config, fresh_adapters)
-    fresh_app = create_app(config, fresh, HomeAssistant(config))
+    fresh_app = create_app(config, fresh, HomeAssistant(config), Accounts(config.config_dir / "agora.db"))
     async with client(fresh_app) as request:
         status = await request.get("/admin/machines/status", headers=headers)
     assert all(machine["operation"] is None for machine in status.json()["machines"].values())
@@ -311,3 +313,35 @@ async def test_update_deployment_rejects_invalid_and_busy(api):
     assert busy.status_code == 409
     assert busy.json()["detail"] == {"code": "deployment_busy", "message": "deployment has an active operation",
                                      "blocking": {"action": "start", "target": "pro", "machines": config.deployments["pro"].machines}}
+
+
+async def test_accounts_admin(api):
+    config, _, _, app, headers = api
+    async with client(app) as request:
+        new = await request.post("/admin/accounts/new", json={"name": " Ana "}, headers=headers)
+        blank = await request.post("/admin/accounts/new", json={"name": "  "}, headers=headers)
+        user_id = new.json()["id"]
+        listed = await request.get("/admin/accounts", headers=headers)
+        invite = await request.post(f"/admin/accounts/{user_id}/invite", headers=headers)
+        unknown_invite = await request.post("/admin/accounts/missing/invite", headers=headers)
+        disabled = await request.post(f"/admin/accounts/{user_id}/disable", json={"disabled": True}, headers=headers)
+        listed_disabled = await request.get("/admin/accounts", headers=headers)
+        refused = await request.post(f"/admin/accounts/{user_id}/invite", headers=headers)
+        await request.post(f"/admin/accounts/{user_id}/disable", json={"disabled": False}, headers=headers)
+        again = await request.post(f"/admin/accounts/{user_id}/invite", headers=headers)
+        not_bool = await request.post(f"/admin/accounts/{user_id}/disable", json={"disabled": "yes"}, headers=headers)
+        unknown_disable = await request.post("/admin/accounts/missing/disable", json={"disabled": True}, headers=headers)
+        revoke = await request.post(f"/admin/accounts/{user_id}/revoke", headers=headers)
+        unknown_revoke = await request.post("/admin/accounts/missing/revoke", headers=headers)
+    assert new.status_code == 201 and blank.status_code == 422
+    assert re.fullmatch(r"[0-9a-f-]{36}", user_id) and re.fullmatch(r"[0-9a-f]{32}", new.json()["invite_code"])
+    expires = datetime.fromisoformat(new.json()["expires_at"]) - datetime.now(timezone.utc)
+    assert timedelta(minutes=9) < expires <= timedelta(minutes=10)
+    assert listed.json() == {"accounts": [{"id": user_id, "name": "Ana", "disabled": False}]}
+    assert invite.status_code == 201 and invite.json()["invite_code"] != new.json()["invite_code"]
+    assert disabled.json() == {"id": user_id, "name": "Ana", "disabled": True}
+    assert listed_disabled.json()["accounts"][0]["disabled"] is True
+    assert refused.status_code == 409 and again.status_code == 201 and not_bool.status_code == 422
+    assert unknown_invite.status_code == unknown_disable.status_code == unknown_revoke.status_code == 404
+    assert revoke.json() == {"revoked": 0}
+    assert (config.config_dir / "agora.db").stat().st_mode & 0o777 == 0o600

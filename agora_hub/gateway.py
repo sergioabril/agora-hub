@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from .accounts import Accounts
 from .config import Config
 from .controller import Controller
 from .harness import Harness, Message, UpstreamDown, UpstreamError, error_text
@@ -20,18 +21,16 @@ class GatewayError(Exception):
         self.status, self.code, self.message, self.headers = status, code, message, headers
 
 
-def create_gateway(config: Config, controller: Controller, transport=None) -> FastAPI:
+def create_gateway(config: Config, controller: Controller, accounts: Accounts, transport=None) -> FastAPI:
     client = httpx.AsyncClient(
         transport=transport, timeout=httpx.Timeout(None, connect=config.hub.timeouts.http_seconds)
     )
 
-    async def authenticate(authorization: Annotated[str | None, Header()] = None):
-        keys = config.hub.gateway.api_keys
-        if keys and not any(
-            secrets.compare_digest((authorization or "").encode(), f"Bearer {key.get_secret_value()}".encode())
-            for key in keys
-        ):
-            raise GatewayError(401, "invalid_api_key", "invalid gateway key")
+    async def authenticate(authorization: Annotated[str | None, Header()] = None) -> dict:
+        if authorization and authorization.startswith("Bearer "):
+            if user := accounts.user(authorization.removeprefix("Bearer ")):
+                return user
+        raise GatewayError(401, "invalid_api_key", "invalid token")
 
     def resolve(model: str) -> tuple[str, str]:
         llms = controller.serving("llm")
@@ -54,13 +53,13 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
     files = FileStore(config.config_dir / "files")
     harness = Harness(client, Tools(client, files, image_target, config.hub.timeouts.image_seconds), files)
 
-    async def parse(request: Request) -> dict:
+    async def parse(request: Request, field: str = "model") -> dict:
         try:
             body = json.loads(await request.body())
         except ValueError:
             body = None
-        if not isinstance(body, dict) or not isinstance(body.get("model"), str):
-            raise GatewayError(400, "invalid_request", "body must be a JSON object with a string model")
+        if not isinstance(body, dict) or not isinstance(body.get(field), str):
+            raise GatewayError(400, "invalid_request", f"body must be a JSON object with a string {field}")
         return body
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -72,6 +71,17 @@ def create_gateway(config: Config, controller: Controller, transport=None) -> Fa
         kind = "invalid_request_error" if error.status < 500 else "server_error"
         content = {"error": {"message": error.message, "type": kind, "code": error.code}}
         return JSONResponse(content, error.status, error.headers)
+
+    @app.post("/agora/v1/link")
+    async def link(request: Request):
+        body = await parse(request, "code")
+        if linked := accounts.link(body["code"]):
+            return linked
+        raise GatewayError(400, "invalid_invite", "invite code is invalid, expired or already used")
+
+    @router.get("/agora/v1/me")
+    async def me(user: Annotated[dict, Depends(authenticate)]):
+        return user
 
     @router.get("/openai/v1/models")
     async def models():

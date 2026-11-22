@@ -6,14 +6,17 @@ import re
 import httpx
 import pytest
 
+from agora_hub.accounts import Accounts
+from agora_hub.api import create_app
 from agora_hub.config import DeploymentConfig, load_config
 from agora_hub.controller import Controller
+from agora_hub.home_assistant import HomeAssistant
 from agora_hub.gateway import create_gateway
 from agora_hub.harness import SHOWN, Delta, Failed, Finished, Harness, ToolFinished, ToolStarted, UpstreamError
 from agora_hub.tools import IMAGE_NOTE, SEARCH_NOTE, VISION_NOTE, FileStore, Tools
 from tests.fakes import FakeAdapters
 
-KEY = {"Authorization": "Bearer " + "b" * 64}
+KEY = {}  # the gateway fixture puts a linked token here
 SSE = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
@@ -37,12 +40,15 @@ def upstream(requests, replies):
 
 
 @pytest.fixture
-def gateway(config_dir):
+def gateway(config_dir, monkeypatch):
     config = load_config(config_dir)
     adapters = FakeAdapters()
     controller = Controller(config, adapters)
     requests, replies = [], []
-    app = create_gateway(config, controller, upstream(requests, replies))
+    accounts = Accounts(config_dir / "agora.db")
+    token = accounts.link(accounts.add("Test")["invite_code"])["token"]
+    monkeypatch.setitem(KEY, "Authorization", "Bearer " + token)
+    app = create_gateway(config, controller, accounts, upstream(requests, replies))
     return config, adapters, controller, app, requests, replies
 
 
@@ -88,7 +94,7 @@ def ask(request, messages, **body):
 
 
 async def test_auth_and_models(gateway):
-    config, adapters, controller, app, _, _ = gateway
+    _, adapters, controller, app, _, _ = gateway
     async with client(app) as request:
         empty = await request.get("/openai/v1/models", headers=KEY)
         adapters.readiness.update(pro=True, images=True)
@@ -100,16 +106,85 @@ async def test_auth_and_models(gateway):
         embeddings = await request.post("/openai/v1/embeddings", json={"model": "agora"}, headers=KEY)
         get_chat = await request.get("/openai/v1/chat/completions", headers=KEY)
         old = [await request.get(f"/{prefix}/v1/models", headers=KEY) for prefix in ("proxy", "agent")]  # removed
-        config.hub.gateway.api_keys = []
-        open_ = await request.get("/openai/v1/models")
     assert empty.json() == {"object": "list", "data": []}
     assert wrong.status_code == missing.status_code == 401
-    assert wrong.json() == {"error": {"message": "invalid gateway key", "type": "invalid_request_error", "code": "invalid_api_key"}}
+    assert wrong.json() == {"error": {"message": "invalid token", "type": "invalid_request_error", "code": "invalid_api_key"}}
     assert [(m["id"], m["owned_by"]) for m in listed.json()["data"]] == [("agora", "agora"), ("m1", "pro"), ("m2", "pro")]
     assert [r.status_code for r in (embeddings, get_chat, *old)] == [404] * 4
     assert embeddings.json()["error"]["code"] == get_chat.json()["error"]["code"] == "not_found"
     assert embeddings.json()["error"]["message"].startswith("POST /openai/v1/embeddings is not served; the gateway serves GET")
-    assert open_.status_code == 200 and open_.json() == listed.json()
+
+
+async def test_accounts_link(gateway):
+    config, _, _, app, _, _ = gateway
+    accounts = Accounts(config.config_dir / "agora.db")
+    admin = create_app(config, Controller(config, FakeAdapters()), HomeAssistant(config), accounts)
+    admin_headers = {"Authorization": "Bearer " + "a" * 64}
+    seen = []
+
+    def bearer(token):
+        return {"Authorization": "Bearer " + token}
+
+    async with client(admin) as admin_request, client(app) as request:
+        async def new(name):
+            reply = (await admin_request.post("/admin/accounts/new", json={"name": name}, headers=admin_headers)).json()
+            seen.append(reply["invite_code"])
+            return reply["id"], reply["invite_code"]
+
+        async def invite(user_id):
+            code = (await admin_request.post(f"/admin/accounts/{user_id}/invite", headers=admin_headers)).json()["invite_code"]
+            seen.append(code)
+            return code
+
+        async def link(code):
+            reply = await request.post("/agora/v1/link", json={"code": code})
+            if reply.status_code == 200:
+                seen.append(reply.json()["token"])
+            return reply
+
+        async def status(token, path="/agora/v1/me"):
+            return (await request.get(path, headers=bearer(token))).status_code
+
+        ana, code = await new("Ana")
+        linked = await link(code)
+        token = linked.json()["token"]
+        me = await request.get("/agora/v1/me", headers=bearer(token))
+        models = await status(token, "/openai/v1/models")
+        reused = await link(code)
+        expired_code = await invite(ana)
+        with accounts.db:
+            accounts.db.execute("UPDATE user_invites SET expires_at = '2000-01-01T00:00:00+00:00' WHERE consumed = 0")
+        expired = await link(expired_code)
+        no_code = await request.post("/agora/v1/link", json={"name": "Ana"})
+        second = (await link(await invite(ana))).json()["token"]
+        both = [await status(token), await status(second)]
+        pending = await invite(ana)
+        revoked = await admin_request.post(f"/admin/accounts/{ana}/revoke", headers=admin_headers)
+        after_revoke = [await status(token), await status(second), (await link(pending)).status_code]
+
+        bob, bob_code = await new("Bob")
+        bob_token = (await link(bob_code)).json()["token"]
+        bob_pending = await invite(bob)
+        await admin_request.post(f"/admin/accounts/{bob}/disable", json={"disabled": True}, headers=admin_headers)
+        while_disabled = [await status(bob_token), (await link(bob_pending)).status_code]
+        await admin_request.post(f"/admin/accounts/{bob}/disable", json={"disabled": False}, headers=admin_headers)
+        enabled = await status(bob_token)
+
+        missing = await request.get("/agora/v1/me")
+        unknown = await status("c" * 64)
+        non_ascii = await request.get("/agora/v1/me", headers={"Authorization": "Bearer caf\u00e9".encode("latin-1")})
+    assert linked.status_code == 200 and re.fullmatch(r"[0-9a-f]{64}", token)
+    assert linked.json()["user"] == me.json() == {"id": ana, "name": "Ana"}
+    assert models == 200
+    assert [(r.status_code, r.json()["error"]["code"]) for r in (reused, expired, no_code)] == [
+        (400, "invalid_invite"), (400, "invalid_invite"), (400, "invalid_request")]
+    assert both == [200, 200]
+    assert revoked.json() == {"revoked": 2}
+    assert after_revoke == [401, 401, 400]
+    assert while_disabled == [401, 400] and enabled == 200
+    assert missing.status_code == unknown == non_ascii.status_code == 401
+    db = (config.config_dir / "agora.db").read_bytes()
+    assert not [value for value in seen if value.encode() in db]
 
 
 async def test_routing(gateway):

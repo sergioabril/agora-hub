@@ -4,6 +4,7 @@ import httpx
 import pytest
 import yaml
 
+from agora_hub.accounts import Accounts
 from agora_hub.api import create_app
 from agora_hub.config import load_config
 from agora_hub.controller import Controller
@@ -32,7 +33,7 @@ def ha(config_dir):
 
     config = load_config(config_dir)
     home_assistant = HomeAssistant(config, httpx.MockTransport(handler))
-    app = create_app(config, Controller(config, FakeAdapters()), home_assistant)
+    app = create_app(config, Controller(config, FakeAdapters()), home_assistant, Accounts(config_dir / "agora.db"))
     client = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test",
         headers={"Authorization": "Bearer " + "a" * 64},

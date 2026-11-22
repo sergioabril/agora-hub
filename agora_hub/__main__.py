@@ -6,6 +6,7 @@ from pathlib import Path
 
 import uvicorn
 
+from .accounts import Accounts
 from .api import create_app
 from .adapters import make_adapters
 from .config import ConfigError, load_config
@@ -37,8 +38,9 @@ def main() -> None:
         gateway_config.public_host = args.public_host
     adapters = make_adapters(config)
     controller = Controller(config, adapters)
-    admin = create_app(config, controller, adapters.home_assistant)
-    gateway = create_gateway(config, controller)
+    accounts = Accounts(config.config_dir / "agora.db")
+    admin = create_app(config, controller, adapters.home_assistant, accounts)
+    gateway = create_gateway(config, controller, accounts)
     gateway_port = gateway_config.port
 
     async def dispatch(scope, receive, send):

@@ -33,7 +33,6 @@ def test_valid_config_loads(config_dir: Path):
         ("machines.yaml", lambda data: data["machines"]["spark-1"].update(device="toaster")),
         ("hub.yaml", lambda data: data["api"].update(unknown=True)),
         ("hub.yaml", lambda data: data["api"].update(admin_token="bad")),
-        ("hub.yaml", lambda data: data["gateway"].update(api_keys=["bad"])),
         ("hub.yaml", lambda data: data["gateway"].update(port=3333)),
         ("deployments.yaml", lambda data: data["deployments"]["pro"].pop("kind")),
         ("hub.yaml", lambda data: data["home_assistant"].update(host="http://homeassistant.local")),

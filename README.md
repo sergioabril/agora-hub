@@ -35,7 +35,7 @@ make deploy
 
 It then builds the image and starts the hub in the background, publishing port `3333` (admin API) and port `8888` (gateway), with the config folder mounted writable so the add and update endpoints can save machines and deployments. The container uses `--restart unless-stopped`, so it comes back after a crash, a Docker restart or a reboot (on macOS, enable Docker Desktop's "Start when you sign in"). Run `make deploy` again to rebuild and replace it; nothing in the config folder is overwritten. Use `make deploy CONFIG_DIR=/other/path` for a different folder.
 
-> **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`). `gateway.api_keys` also starts empty, so the gateway on port `8888` is open too: anyone who can reach it can use the running models. Set gateway keys (§3) before sharing the network.
+> **Security: a fresh deploy has no authentication.** `api.admin_token` starts empty, and while it is empty the hub accepts every request, with any bearer token or none. `make deploy` publishes port `3333` on all network interfaces, so anyone who can reach this machine can power machines on and off, start and stop deployments, and add or edit machines. Set a token before using the hub on a shared network: put `openssl rand -hex 32` output in `api.admin_token` in `hub.yaml`, run `docker restart agora-hub`, and give the same value to agora-dashboard (`AGORA_HUB_ADMIN_TOKEN`). While `api.admin_token` is empty, anyone who can reach port `3333` can also create users, and so get gateway tokens. The gateway on port `8888` always needs a user token (§4 "Accounts"); it has no open mode.
 
 After the first deploy, set Home Assistant's `host`, `port` and long-lived access `token` through `POST /admin/integrations/homeassistant`, then add machines through `POST /admin/machines/add`, then deployments through `POST /admin/deployments/add` (see §4). After editing a YAML file by hand, run `docker restart agora-hub`.
 
@@ -53,9 +53,7 @@ Logs: `docker logs -f agora-hub` (the gateway's conversation log is described in
 
 ```yaml
 api: {host: 127.0.0.1, port: 3333, admin_token: ""}
-gateway:
-  port: 8888
-  api_keys: [] # empty = NO authentication; otherwise each key is 64 hex chars (openssl rand -hex 32)
+gateway: {port: 8888}
 ssh: {known_hosts_path: known_hosts}
 home_assistant:
   host: homeassistant.local
@@ -80,7 +78,7 @@ timeouts:
   image_seconds: 300
 ```
 
-Gateway keys: `gateway.api_keys` is a list; empty means the gateway on `gateway.port` accepts every request, otherwise each key is 64 hex characters (`openssl rand -hex 32`) and clients send one as `Authorization: Bearer <key>`. Gateway keys are independent of the admin token: neither works in place of the other. Edit the list in `hub.yaml`, then run `docker restart agora-hub`. `gateway.port` must differ from `api.port`. `timeouts.image_seconds` bounds one image generation or edit.
+`gateway.port` must differ from `api.port`. `timeouts.image_seconds` bounds one image generation or edit.
 
 The hub calls Home Assistant at plain `http://<host>:<port>` (`host` is an IP or hostname, without scheme). An empty `token` means Home Assistant is not configured: the switch endpoints answer `409` and waking a machine fails.
 
@@ -136,6 +134,8 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 
 `known_hosts` and relative SSH key paths are resolved from the configuration directory.
 
+The hub creates `agora.db` (SQLite: users, invites and token hashes) in the configuration directory, next to `files/`. It's backed up with the folder.
+
 ## 4. Endpoint calls
 
 When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <admin-token>` and answers `401` otherwise; when it is empty, no endpoint checks authentication. Add and update apply immediately (no restart) and rewrite `machines.yaml` or `deployments.yaml`, which drops its YAML comments; saving the Home Assistant settings likewise rewrites `hub.yaml` and drops its comments.
@@ -152,6 +152,11 @@ When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <a
 | `POST /admin/deployments/{deployment_id}/update` | Any subset of deployment fields; `null` drops one, which is a `422` since all are required | Updates a deployment; returns `200` with the deployment, `404`, `409` (`deployment_busy` while it has an active operation), `422`, or `500`. |
 | `POST /admin/deployments/{deployment_id}` | `{"action":"start"}` or `{"action":"stop"}` | Starts the deployment's start or stop script on `head`; returns `202` with the operation's live NDJSON stream (below), or `404`, `409` (`busy`, `deployment_active`), or `422` as JSON. Closing the stream doesn't affect the operation. |
 | `GET /admin/deployments/{deployment_id}/output` | None | Returns `200` with the NDJSON stream of the deployment's current or last operation (a finished one replays its log and ends at once), `404 Deployment not found`, or `404 No operation` when it has had none since the hub started. |
+| `GET /admin/accounts` | None | Returns `200 {"accounts": [{"id", "name", "disabled"}]}`: every user, oldest first. |
+| `POST /admin/accounts/new` | `{"name":"Ana"}` | Creates a user and its first invite; returns `201 {"id", "invite_code", "expires_at"}`, or `422` for a missing or blank name. |
+| `POST /admin/accounts/{user_id}/disable` | `{"disabled":true}` or `{"disabled":false}` | Pauses or resumes a user; returns `200 {"id", "name", "disabled"}`, `404 Account not found`, or `422` unless `disabled` is a JSON boolean. |
+| `POST /admin/accounts/{user_id}/invite` | None | Creates a new invite; returns `201 {"id", "invite_code", "expires_at"}`, `404 Account not found`, or `409 Account is disabled`. |
+| `POST /admin/accounts/{user_id}/revoke` | None | Revokes all of the user's tokens and unused invites; returns `200 {"revoked": <tokens revoked>}` or `404 Account not found`. |
 | `GET /admin/integrations/homeassistant` | None | Returns `{"host", "port", "token", "power_cycle_delay_seconds"}` without contacting Home Assistant; `token` is `""` when not configured. It returns the token to any authorized caller. |
 | `POST /admin/integrations/homeassistant` | Any subset of `host`, `port`, `token`, `power_cycle_delay_seconds`; `null` resets one to its default, and a `null` or `""` token unsets it | Saves the settings without contacting Home Assistant; returns `200` with the settings view, `422`, or `500`. |
 | `POST /admin/integrations/homeassistant/test` | As for POST | Validates the merged settings and calls Home Assistant's `GET /api/` with them, saving nothing; returns `200 {"reachable", "error"}` (`reachable` when Home Assistant answered at all, `error` is `null` when it accepted the token, otherwise `not_configured: ...` or `http: ...`), or `422`. |
@@ -161,31 +166,31 @@ When `api.admin_token` is set, every endpoint requires `Authorization: Bearer <a
 Deployment streams are `application/x-ndjson`, one JSON object per line: first `{"type":"operation","operation":{...}}` (the operation as it is now), then `{"type":"line","source":"hub"|"stdout"|"stderr","text":...,"at":...}` for each buffered and then live line (the hub keeps the last 2,000 lines of each deployment's last operation, in memory), and last `{"type":"end","operation":{...}}` once the operation finishes.
 
 ```sh
-TOKEN=your-64-character-token
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/machines/status
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+ADMIN_TOKEN=your-64-character-token
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3333/admin/machines/status
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"on"}' http://localhost:3333/admin/machines/spark-1
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Spark 5","host":"spark-5.local","user":"agora","password":"...","plug_entity_id":"switch.spark_5"}' \
   http://localhost:3333/admin/machines/add
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Spark 5","host":"spark-5.local","user":"agora","password":"...","plug_entity_id":"switch.spark_5"}' \
   http://localhost:3333/admin/machines/test
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"host":"10.0.0.5"}' http://localhost:3333/admin/machines/spark-1/update
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/status
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3333/admin/deployments/status
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Pro","kind":"llm","machines":["spark-1","spark-2"],"head":"spark-1","start_command":"/home/agora/pro/start.sh","stop_command":"/home/agora/pro/stop.sh","endpoint":"http://spark-1.local:8000/v1"}' \
   http://localhost:3333/admin/deployments/add
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"start_command":"/home/agora/pro/start.sh --tp 2"}' http://localhost:3333/admin/deployments/pro/update
-curl -N -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -N -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"start"}' http://localhost:3333/admin/deployments/pro
-curl -N -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/deployments/pro/output
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -N -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3333/admin/deployments/pro/output
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{}' http://localhost:3333/admin/integrations/homeassistant/test
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3333/admin/integrations/homeassistant/switches
-curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3333/admin/integrations/homeassistant/switches
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '[{"entity_id":"switch.lamp","state":"on"}]' http://localhost:3333/admin/integrations/homeassistant/switches
 ```
 
@@ -193,30 +198,49 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
 
 The gateway speaks the OpenAI API. Clients use the base URL `http://<public host>:8888/openai/v1`; the prefix names the API format.
 
-When `gateway.api_keys` is set, `/openai/v1` requires `Authorization: Bearer <gateway key>` and answers `401 invalid_api_key` otherwise. The admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
+Every `/openai/v1` route and `GET /agora/v1/me` require `Authorization: Bearer <token>`, a user token from `/agora/v1/link` (see "Accounts" below). A missing, unknown or revoked token, or a disabled user's token, gets `401 invalid_api_key`. There's no cache: a revoke, disable or enable applies from the next request. The admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
 
 `model: "agora"` goes to the first running LLM deployment (in `deployments.yaml` order) and its first served model id. It's the model-agnostic choice for small tools that don't care which model answers. Any other `model` must exactly match a model id a running LLM deployment serves. Otherwise the request fails with `404 model_not_found`, or `503` while no LLM is running.
 
 | Method and path | Auth | What it does |
 | --- | --- | --- |
-| `GET /openai/v1/models` | key | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
-| `POST /openai/v1/chat/completions` | key | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
-| `POST /openai/v1/responses` | key | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
-| Any other method or path under `/openai/v1/` | key | `404 not_found`, naming the three routes above. `GET /openai/v1/chat/completions` and `GET /openai/v1/responses/<id>` get it too. |
+| `POST /agora/v1/link` | none | Body `{"code":"<invite code>"}`. Returns `200 {"token", "user": {"id", "name"}}`, `400 invalid_request`, or `400 invalid_invite` (invalid, expired or already used). |
+| `GET /agora/v1/me` | token | `200 {"id", "name"}`: the token's user. |
+| `GET /openai/v1/models` | token | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
+| `POST /openai/v1/chat/completions` | token | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
+| `POST /openai/v1/responses` | token | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
+| Any other method or path under `/openai/v1/` | token | `404 not_found`, naming the three routes above. `GET /openai/v1/chat/completions` and `GET /openai/v1/responses/<id>` get it too. |
 
-The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the key and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
+The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the token and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
 
 - Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
 - `files/` (in the config folder) holds the images the Responses harness stores and, next to each image it generated, the tool call that made it (`<id>.json`). It is never cleaned up and not served over HTTP.
 
 ```sh
-KEY=your-64-character-gateway-key
-curl -H "Authorization: Bearer $KEY" http://localhost:8888/openai/v1/models
-curl -N -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+TOKEN=your-64-character-token # from /agora/v1/link
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8888/openai/v1/models
+curl -N -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"agora","stream":true,"messages":[{"role":"user","content":"hi"}]}' http://localhost:8888/openai/v1/chat/completions
-curl -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"agora","messages":[{"role":"user","content":"hi"}]}' http://localhost:8888/openai/v1/chat/completions
 ```
+
+### Accounts
+
+The admin creates a user and gets an invite code, valid once for 10 minutes. The client redeems it at `/agora/v1/link` on the gateway port for a token. The token is shown once; the hub stores only its SHA-256. `revoke` cuts off all of a user's tokens and unused invites; a new invite then gives a new token. Disabling pauses a user, and enabling brings back their tokens that weren't revoked. Revoking is for good.
+
+```sh
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Ana"}' http://localhost:3333/admin/accounts/new     # {"id", "invite_code", "expires_at"}
+curl -X POST -H 'Content-Type: application/json' -d '{"code":"<invite_code>"}' \
+  http://localhost:8888/agora/v1/link                               # {"token", "user": {"id", "name"}}
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8888/agora/v1/me
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"disabled":true}' http://localhost:3333/admin/accounts/<id>/disable
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3333/admin/accounts/<id>/revoke
+```
+
+Never open `agora.db` from the host while the hub runs: Docker Desktop's bind mount crosses a VM, and SQLite's file locking isn't reliable across it. To look inside, use `docker exec -it agora-hub python -m sqlite3 /config/agora.db`.
 
 ### Responses API
 
@@ -256,7 +280,7 @@ response.completed (the response object with all four items)
 Without `stream`, the body is the final response object, with HTTP 200 whether it ended `completed`, `incomplete` or `failed`.
 
 ```sh
-curl -N -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+curl -N -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"agora","stream":true,"input":"draw a red fox"}' http://localhost:8888/openai/v1/responses
 ```
 
@@ -280,7 +304,7 @@ Request ids: chat requests get `chat_<16 hex>`, Responses requests their respons
 
 Images are shortened: a base64 data URL keeps its `data:…;base64,` head followed by `<N chars>`, and a long `result` or `b64_json` becomes `<N chars>`. Everything else, including what users send, is logged in full, so treat the host's Docker logs as sensitive. Docker keeps 5 × 20 MB per container, and each `make deploy` starts a fresh log.
 
-APIs the gateway doesn't serve yet: a coding agent that needs one (Codex needs Responses features the hub doesn't have) can use a deployment's own endpoint directly. That endpoint has no gateway key and no `agora` alias.
+APIs the gateway doesn't serve yet: a coding agent that needs one (Codex needs Responses features the hub doesn't have) can use a deployment's own endpoint directly. That endpoint has no token check and no `agora` alias.
 
 Planned (not built yet):
 
