@@ -10,6 +10,10 @@ def _short(value, key=None):
     if isinstance(value, str):
         if value.startswith("data:") and ";base64," in value:
             return f"{value[:value.index(',') + 1]}<{len(value)} chars>"
+        if key in ("authorization", "cookie", "set-cookie"):
+            return "<redacted>"
+        if key in ("content", "arguments", "text") and len(value) > 2000:
+            return value[:2000] + f"… <{len(value)} chars>"
         if key in ("result", "b64_json") and len(value) > 100:
             return f"<{len(value)} chars>"
     return value

@@ -39,8 +39,8 @@ def main() -> None:
     adapters = make_adapters(config)
     controller = Controller(config, adapters)
     accounts = Accounts(config.config_dir / "agora.db")
-    admin = create_app(config, controller, adapters.home_assistant, accounts)
     gateway = create_gateway(config, controller, accounts)
+    admin = create_app(config, controller, adapters.home_assistant, accounts, shutdown=gateway.state.close)
     gateway_port = gateway_config.port
 
     async def dispatch(scope, receive, send):

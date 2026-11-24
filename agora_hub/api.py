@@ -1,6 +1,7 @@
 import asyncio
 import json
 import secrets
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
@@ -32,7 +33,10 @@ class DisableAccount(BaseModel):
     disabled: StrictBool
 
 
-def create_app(config: Config, controller: Controller, home_assistant: HomeAssistant, accounts: Accounts) -> FastAPI:
+def create_app(
+    config: Config, controller: Controller, home_assistant: HomeAssistant, accounts: Accounts,
+    *, shutdown: Callable[[], Awaitable[None]] | None = None,
+) -> FastAPI:
     async def authenticate(authorization: Annotated[str | None, Header()] = None):
         token = config.hub.api.admin_token
         if token is None:
@@ -49,11 +53,12 @@ def create_app(config: Config, controller: Controller, home_assistant: HomeAssis
         finally:
             for task in tasks:
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            await controller.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await controller.close()
+            finally:
+                if shutdown is not None:
+                    await shutdown()
 
     app = FastAPI(
         docs_url=None,

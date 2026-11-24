@@ -1,6 +1,7 @@
 import asyncio
 import json
 import secrets
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 import httpx
@@ -51,7 +52,21 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
         return None
 
     files = FileStore(config.config_dir / "files")
-    harness = Harness(client, Tools(client, files, image_target, config.hub.timeouts.image_seconds), files)
+    tools = Tools(client, files, image_target, config.hub.timeouts.image_seconds, config.hub.tools)
+    harness = Harness(client, tools, files)
+
+    async def close():
+        try:
+            await tools.close()
+        finally:
+            await client.aclose()
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        try:
+            yield
+        finally:
+            await close()
 
     async def parse(request: Request, *fields: str) -> dict:
         try:
@@ -63,7 +78,9 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
                 raise GatewayError(400, "invalid_request", f"body must be a JSON object with a string {field}")
         return body
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.close = close
+    app.state.tools = tools
     router = APIRouter(dependencies=[Depends(authenticate)])
 
     @app.exception_handler(GatewayError)

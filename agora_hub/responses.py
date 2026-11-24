@@ -70,14 +70,20 @@ def _item(item: dict, messages: list[dict], store: FileStore):
     elif kind == "function_call_output":
         messages.append({"role": "tool", "tool_call_id": item.get("call_id"),
                          "content": _texts(item.get("output"), "input_text", "")})
-    elif kind == "image_generation_call" and item.get("status") == "completed":
+    elif kind in ("image_generation_call", "web_image_call") and item.get("status") == "completed":
         item_id = str(item.get("id") or "")
-        stem = item_id[3:] if item_id.startswith("ig_") else ""
+        prefix = "wi_" if kind == "web_image_call" else "ig_"
+        stem = item_id[3:] if item_id.startswith(prefix) else ""
+        metadata = store.metadata(stem) if kind == "web_image_call" else None
         name = store.find(stem)
-        if name and (call := store.call(stem)):  # the hub made it: replay the call and its result, as the model saw them
+        call = store.call(stem) if name else None
+        saved_web_image = metadata and metadata.get("type") == "web_image_call"
+        if call and (kind != "web_image_call" or saved_web_image):
             _assistant(messages).setdefault("tool_calls", []).append(call)
-            messages.append({"role": "tool", "tool_call_id": call["id"],
-                             "content": MADE.format(f"![image]({FILES_PATH}{name})")})
+            content = MADE.format(f"![image]({FILES_PATH}{name})")
+            if metadata:
+                content += f" Source: {metadata.get('source_page_url', '')}; image: {metadata.get('image_url', '')}"
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
             return
         if not name and isinstance(item.get("result"), str):
             try:
@@ -85,7 +91,7 @@ def _item(item: dict, messages: list[dict], store: FileStore):
             except ValueError:
                 name = None
         _say(messages, f"![image]({FILES_PATH}{name})" if name else "[image unavailable]")
-    elif kind not in ("image_generation_call", "reasoning", "web_search_call"):  # past reasoning and searches are skipped
+    elif kind not in ("image_generation_call", "web_image_call", "reasoning", "web_search_call"):  # past reasoning and searches are skipped
         raise BadRequest(f"input item type {kind} is not supported")
 
 
@@ -179,15 +185,20 @@ class Render:
 
     def started(self, event: ToolStarted) -> list[str]:
         call, out = event.call, self.close()
+        action = dict(call.progress)
         if call.kind == "view":  # the model looks at an older image: nothing for the client to draw
             return out
         if call.kind == "image":
             item = {"type": "image_generation_call", "id": f"ig_{call.id}", "status": "in_progress",
                     "action": call.action, "revised_prompt": call.text, "result": None}
             prefix, stages = "response.image_generation_call", ("in_progress", "generating")
+        elif call.action == "show_web_image":
+            item = {"type": "web_image_call", "id": f"wi_{call.id}", "status": "in_progress",
+                    "result": None, "action": action, "label": action.get("label", "Showing web image")}
+            prefix, stages = "response.web_image_call", ("in_progress",)
         else:
             item = {"type": "web_search_call", "id": f"ws_{call.id}", "status": "in_progress",
-                    "action": {"type": "search", "query": call.text}}
+                    "action": action, "label": action.get("label", call.text)}
             prefix, stages = "response.web_search_call", ("in_progress", "searching")
         added, index = self.add(item)
         self.tool = (item, index, prefix)
@@ -200,12 +211,21 @@ class Render:
         if event.output:
             out.append(self.send(f"{prefix}.completed", item_id=item["id"], output_index=index))
             item["status"] = "completed"
-            if item["type"] == "image_generation_call" and event.output.images:
-                name = event.output.images[0]
+            if event.output.progress and item["type"] in ("web_search_call", "web_image_call"):
+                item["action"] = {**item.get("action", {}), **event.output.progress}
+                item["label"] = item["action"].get("label", item.get("label"))
+            if event.output.media and item["type"] == "web_image_call":
+                item.update({key: event.output.media[key] for key in ("source_page_url", "image_url")
+                             if key in event.output.media})
+            if item["type"] in ("image_generation_call", "web_image_call") and event.output.images:
+                name = (event.output.media or {}).get("name", event.output.images[0])
                 item["result"] = base64.b64encode(self.store.path(name).read_bytes()).decode()
                 item["output_format"] = FORMATS[name.split(".")[1]]
         else:
             item["status"] = "failed"
+            item["error"] = {"message": event.error or "tool failed"}
+            out.append(self.send(f"{prefix}.failed", item_id=item["id"], output_index=index,
+                                 error=item["error"]))
         return [*out, self.send("response.output_item.done", output_index=index, item=item)]
 
     def finished(self, event: Finished) -> list[str]:
@@ -253,7 +273,7 @@ async def _rendered(harness: Harness, turn, render: Render, request_id: str, str
         raise
     finally:
         await events.aclose()  # cancels a running tool and closes the LLM response
-        await turn.response.aclose()  # in case the client left before the events started
+        await harness.cleanup(turn)  # also covers leaving before the event iterator starts
 
 
 async def respond(harness: Harness, store: FileStore, body: dict, url: str, request_id: str) -> Response:

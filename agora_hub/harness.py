@@ -6,12 +6,13 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 
-from .tools import FILES_PATH, Call, FileStore, ToolContext, ToolError, ToolOutput, Tools
+from .tools import FILES_PATH, Call, FileStore, ToolContext, ToolOutput, Tools
 from .trace import trace
 
-MAX_ROUNDS = 10  # runaway backstop only; a normal reply ends after 1–3 calls
+MAX_TOOL_ITERATIONS = 40  # plus one final answer iteration
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,(.*)", re.S)
 SHOWN = "Images shown above, attached so you can see them:"
@@ -109,33 +110,50 @@ class Turn:
     context: ToolContext
     messages: list[dict]
     client_tools: list[dict]
-    hub_tools: list[dict]
-    note: str
+    registry: Tools
     round: int = 1  # number of the upstream call being made or read
     visible: set[str] = field(default_factory=set)  # file names the model may get as image parts in this turn
     attached: set[str] = field(default_factory=set)  # file names already sent to the model as image parts
     response: httpx.Response | None = None  # the round being read
 
+    final: bool = False
+    web_attached: list[str] = field(default_factory=list)
+    cleaned: bool = False
+    web_names: set[str] = field(default_factory=set)
+    web_pixels: dict[str, list[dict]] = field(default_factory=dict)
+
     def payload(self) -> dict:
-        final = self.round == MAX_ROUNDS
-        hub = [] if final else self.hub_tools
+        specs, note = self.registry.offer(self.context)
+        taken = {t["function"]["name"] for t in self.client_tools}
+        hub = [t for t in specs if t["function"]["name"] not in taken]
+        self.final = (self.final or not hub or self.round > MAX_TOOL_ITERATIONS
+                      or self.context.total_actions >= self.registry.config.total_round_limit)
+        if self.final or self.body.get("tool_choice") == "none":
+            hub = []
+        if self.final:
+            note += "\n\nTool research has ended. Give the final answer from collected evidence, include sources actually read, and state limitations. Do not call more hub tools."
         messages = self.messages
-        if hub:
+        if note:
             first = messages[0] if messages else {}
             if first.get("role") == "system" and isinstance(first.get("content"), str):
-                messages = [{**first, "content": first["content"] + "\n\n" + self.note}, *messages[1:]]
+                messages = [{**first, "content": first["content"] + "\n\n" + note}, *messages[1:]]
             else:
-                messages = [{"role": "system", "content": self.note}, *messages]
+                messages = [{"role": "system", "content": note}, *messages]
         payload = {**self.body, "messages": messages, "stream": True, "stream_options": {"include_usage": True}}
         if tools := self.client_tools + hub:
             payload["tools"] = tools
-        elif final:
+        else:
             payload.pop("tools", None)
+        choice = payload.get("tool_choice")
+        forced = choice.get("function", {}).get("name") if isinstance(choice, dict) else None
+        offered = {t["function"]["name"] for t in self.client_tools + hub}
+        if (forced and forced not in offered) or (choice == "required" and not offered):
             payload.pop("tool_choice", None)
         return payload
 
     def split(self, calls: list[dict]) -> tuple[list[dict], list[dict]]:
-        names = set() if self.round == MAX_ROUNDS else {tool["function"]["name"] for tool in self.hub_tools}
+        # A client declaration explicitly owns a collision, even when the hub family is disabled.
+        names = self.registry.owned_names - {t["function"]["name"] for t in self.client_tools}
         return ([call for call in calls if call["function"]["name"] in names],
                 [call for call in calls if call["function"]["name"] not in names])
 
@@ -146,10 +164,7 @@ class Harness:
 
     async def start(self, body: dict, url: str, request_id: str) -> Turn:
         client_tools = body.get("tools") or []
-        taken = {tool.get("function", {}).get("name") for tool in client_tools}
-        specs, note = self.tools.offer()
-        hub_tools = [tool for tool in specs if tool["function"]["name"] not in taken]
-        turn = Turn(body, url, request_id, ToolContext([]), [], client_tools, hub_tools, note)
+        turn = Turn(body, url, request_id, ToolContext([]), [], client_tools, self.tools)
         number, seen = 0, {}  # turn number -> the images that turn refers to; a user message starts a turn
         for message in body["messages"]:
             number += message.get("role") == "user"
@@ -163,8 +178,13 @@ class Harness:
                 found = []
             turn.messages.append(self._message(message, turn, found))
         turn.messages += self._shown(found, turn)
-        if error := await self._send(turn):
-            raise error
+        self._cap_web_images(turn)
+        try:
+            if error := await self._send(turn):
+                raise error
+        except BaseException:
+            await self.cleanup(turn)
+            raise
         return turn
 
     # Request rewrite: every image gets its [image_N] label. The model gets the pixels, once each, of the images in
@@ -177,7 +197,15 @@ class Harness:
         parts = [{"type": "text", "text": f"[{label}]"}]
         if name not in turn.attached:
             turn.attached.add(name)
-            parts.append({"type": "image_url", "image_url": {"url": self.store.data_url(name)}})
+            pixel = {"type": "image_url", "image_url": {"url": self.store.data_url(name)}}
+            metadata = self.store.metadata(name.rsplit(".", 1)[0])
+            if name in turn.web_names or metadata and metadata.get("type") == "web_image_call":
+                turn.web_names.add(name)
+                if name in turn.web_attached:
+                    turn.web_attached.remove(name)
+                turn.web_attached.append(name)
+                turn.web_pixels.setdefault(name, []).append(pixel)
+            parts.append(pixel)
         return parts
 
     def _shown(self, names: list[str], turn: Turn) -> list[dict]:
@@ -272,6 +300,7 @@ class Harness:
         call = self.tools.call(tool_call)
         trace(turn.request_id, "tool.call", call=call.id, name=tool_call["function"]["name"],
               arguments=tool_call["function"]["arguments"])
+        await self.tools.prepare(call, turn.context)
         yield ToolStarted(call)
         started = time.monotonic()
         task = asyncio.ensure_future(self.tools.run(call, turn.context))
@@ -279,15 +308,24 @@ class Harness:
             while not (await asyncio.wait({task}, timeout=10))[0]:
                 yield KeepAlive()
             output, error = task.result(), None
-        except ToolError as exception:
-            output, error = None, str(exception)
+        except Exception as exception:
+            output, error = None, error_text(exception)
         finally:
             task.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(task, return_exceptions=True)
         seconds = round(time.monotonic() - started, 3)
         if output:
             trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, content=output.content,
                   images=output.images)
             images += output.images
+            turn.web_names.update(output.web_images)
+            for name in output.images:
+                if name not in turn.web_names:
+                    continue
+                if name in turn.web_attached:
+                    turn.web_attached.remove(name)
+                turn.web_attached.append(name)
         else:
             trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, error=error)
         yield ToolFinished(call, output, error)
@@ -320,6 +358,9 @@ class Harness:
                 trace(turn.request_id, "upstream.response", round=turn.round, status=turn.response.status_code,
                       message=message.summary())
                 hub_calls, client_calls = turn.split(message.tool_calls())
+                if hub_calls and (turn.final or turn.body.get("tool_choice") == "none"):
+                    yield Failed("model requested hub tools when a tool-free answer was required")
+                    return
                 if hub_calls and not client_calls:
                     turn.messages.append({"role": "assistant", "content": message.content or None,
                                           "tool_calls": hub_calls})
@@ -332,7 +373,8 @@ class Harness:
                     finally:
                         await tool.aclose()
                 turn.visible.update(images)  # what a turn makes or asks to see stays in view while it runs
-                turn.messages += self._shown(images, turn)  # after the round's tool messages, so the next round sees them
+                turn.messages += self._shown(images, turn)
+                self._cap_web_images(turn)
                 if not hub_calls or client_calls:
                     yield Finished(client_calls, message.finish)
                     return
@@ -341,4 +383,30 @@ class Harness:
                     yield Failed(str(error))
                     return
         finally:
-            await turn.response.aclose()
+            await self.cleanup(turn)
+
+    def _cap_web_images(self, turn):
+        evicted = turn.web_attached[:-8]
+        turn.web_attached = turn.web_attached[-8:]
+        if not evicted:
+            return
+        pixels = {id(part) for name in evicted for part in turn.web_pixels.pop(name, [])}
+        labels = {f"[{turn.context.label(name)}]": f"[{turn.context.label(name)}, not attached]" for name in evicted}
+        for message in turn.messages:
+            if isinstance(message.get("content"), list):
+                message["content"] = [part for part in message["content"] if id(part) not in pixels]
+                for part in message["content"]:
+                    if part.get("type") == "text" and part.get("text") in labels:
+                        part["text"] = labels[part["text"]]
+        turn.attached.difference_update(evicted)
+        turn.visible.difference_update(evicted)
+
+    async def cleanup(self, turn):
+        if not turn.cleaned:
+            turn.cleaned = True
+            with anyio.CancelScope(shield=True):
+                try:
+                    if turn.response:
+                        await turn.response.aclose()
+                finally:
+                    await self.tools.cleanup(turn.context)

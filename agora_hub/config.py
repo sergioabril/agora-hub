@@ -95,7 +95,36 @@ class TimeoutsConfig(Model):
     image_seconds: PositiveFloat
 
 
+class SearchBrowserConfig(Model):
+    enabled: bool = True
+    idle_seconds: PositiveFloat = Field(default=300, allow_inf_nan=False)
+
+
+class SearchConfig(Model):
+    enabled: bool = True
+    round_limit: int = Field(default=30, ge=1, le=1000)
+    time_limit_seconds: PositiveFloat = Field(default=180, allow_inf_nan=False)
+    action_timeout_seconds: PositiveFloat = Field(default=45, allow_inf_nan=False)
+    page_chars: int = Field(default=12000, ge=1000, le=120000)
+    engines: list[Literal["bing", "duckduckgo", "google"]] = Field(default_factory=lambda: ["bing", "duckduckgo", "google"])
+    browser: SearchBrowserConfig = Field(default_factory=SearchBrowserConfig)
+
+    @field_validator("engines")
+    @classmethod
+    def distinct_engines(cls, value):
+        if not value or len(set(value)) != len(value):
+            raise ValueError("engines must be nonempty and distinct")
+        return value
+
+
+class ToolsConfig(Model):
+    default_round_limit: int = Field(default=10, ge=1, le=1000)
+    total_round_limit: int = Field(default=40, ge=1, le=1000)
+    search: SearchConfig = Field(default_factory=SearchConfig)
+
+
 class HubConfig(Model):
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
     api: APIConfig
     gateway: GatewayConfig
     ssh: SSHConfig

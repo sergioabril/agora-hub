@@ -345,3 +345,24 @@ async def test_accounts_admin(api):
     assert unknown_invite.status_code == unknown_disable.status_code == unknown_revoke.status_code == 404
     assert revoke.json() == {"revoked": 0}
     assert (config.config_dir / "agora.db").stat().st_mode & 0o777 == 0o600
+
+
+async def test_admin_lifespan_closes_gateway_resources(config_dir):
+    """The two-port dispatcher sends lifespan only to admin, so it must own gateway shutdown."""
+    from agora_hub.gateway import create_gateway
+    config = load_config(config_dir)
+    config.hub.schedule.enabled = False
+    adapters = FakeAdapters()
+    controller = Controller(config, adapters)
+    accounts = Accounts(config_dir / 'agora.db')
+    gateway = create_gateway(config, controller, accounts)
+    admin = create_app(config, controller, HomeAssistant(config), accounts, shutdown=gateway.state.close)
+    closed = []
+    original = gateway.state.tools.close
+    async def close():
+        closed.append(True)
+        await original()
+    gateway.state.tools.close = close
+    async with admin.router.lifespan_context(admin):
+        assert not closed
+    assert closed == [True]

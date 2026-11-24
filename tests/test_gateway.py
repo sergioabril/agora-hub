@@ -14,7 +14,7 @@ from agora_hub.controller import Controller
 from agora_hub.home_assistant import HomeAssistant
 from agora_hub.gateway import create_gateway
 from agora_hub.harness import SHOWN, Delta, Failed, Finished, Harness, ToolFinished, ToolStarted, UpstreamError
-from agora_hub.tools import IMAGE_NOTE, SEARCH_NOTE, VISION_NOTE, FileStore, Tools
+from agora_hub.tools import FileStore, Tools
 from tests.fakes import FakeAdapters
 
 KEY = {}  # the gateway fixture puts a linked token here
@@ -23,7 +23,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
 JPG = b"\xff\xd8\xff" + b"j" * 16
 JPG_URL = "data:image/jpeg;base64," + base64.b64encode(JPG).decode()
-NOTES = "\n\n".join((VISION_NOTE, IMAGE_NOTE, SEARCH_NOTE))
+SEARCH_NAMES = ["web_search", "open_page", "web_look", "view_web_images", "show_web_image"]
 
 
 def upstream(requests, replies):
@@ -339,8 +339,8 @@ async def test_harness_generate(harness):
     assert events[3].output.images == [f"{call.id}.png"]
     first, second = chats(requests)
     assert all(body["stream"] and body["stream_options"] == {"include_usage": True} for body in (first, second))
-    assert [tool["function"]["name"] for tool in first["tools"]] == ["generate_image", "edit_image", "view_image", "web_search"]
-    assert first["messages"][0] == {"role": "system", "content": NOTES}
+    assert [tool["function"]["name"] for tool in first["tools"]] == ["generate_image", "edit_image", "view_image", *SEARCH_NAMES]
+    assert first["messages"][0] == {"role": "system", "content": harness.tools.offer()[1]}
     assistant, tool, shown = second["messages"][-3:]
     assert assistant["tool_calls"][0]["function"]["name"] == "generate_image" and assistant["content"] == "Sure."
     assert tool == {"role": "tool", "tool_call_id": "call_generate_image",
@@ -374,12 +374,16 @@ async def test_harness_history_and_edit(harness):
     assert edit.count(b'name="image"; filename=') == 2 and edit.index(JPG) < edit.index(PNG)
 
 
-async def test_harness_tools_and_errors(harness, capsys):
+async def test_harness_tools_and_errors(harness, capsys, monkeypatch):
     harness, _, requests, replies, image = harness
+    from agora_hub.tools import ToolError
+    async def denied(call, context):
+        raise ToolError("fixture search failure")
+    monkeypatch.setattr(harness.tools.groups[1], "run", denied)
     user = [{"role": "user", "content": "hi"}]
     replies += [sse(tool_call("web_search", query="news"), finish="tool_calls"), sse({"content": "No search."})]
     searched = await turn(harness, user)
-    assert searched[1].call.text == "news" and searched[1].error.startswith("TO BE IMPLEMENTED: web search")
+    assert searched[1].call.text == "news" and searched[1].error == "fixture search failure"
     assert chats(requests)[-1]["messages"][-1]["content"] == "error: " + searched[1].error
     lookup = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
     replies.append(sse(tool_call("lookup", q="x"), finish="tool_calls"))
@@ -394,7 +398,7 @@ async def test_harness_tools_and_errors(harness, capsys):
     image.clear()
     replies.append(sse({"content": "ok"}))
     await turn(harness, user)
-    assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["view_image", "web_search"]
+    assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["view_image", *SEARCH_NAMES]
     events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
     assert events.count("tool.call") == events.count("tool.result") == 2
 
@@ -453,7 +457,7 @@ async def test_responses_input(gateway):
     sent = chats(requests)[0]
     assert reply.status_code == 200 and len(chats(requests)) == 1
     assert sent["messages"] == [
-        {"role": "system", "content": "Be brief.\n\n" + NOTES},
+        {"role": "system", "content": "Be brief.\n\n" + app.state.tools.offer()[1]},
         {"role": "system", "content": "Be kind."},
         {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "text", "text": "[image_1]"},
                                      {"type": "image_url", "image_url": {"url": JPG_URL}}]},
@@ -463,7 +467,7 @@ async def test_responses_input(gateway):
         {"role": "user", "content": [{"type": "text", "text": SHOWN}, {"type": "text", "text": "[image_2]"},
                                      {"type": "image_url", "image_url": {"url": PNG_URL}}]}]
     assert sent["tools"][0] == {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
-    assert [tool["function"]["name"] for tool in sent["tools"]] == ["lookup", "generate_image", "edit_image", "view_image", "web_search"]
+    assert [tool["function"]["name"] for tool in sent["tools"]] == ["lookup", "generate_image", "edit_image", "view_image", *SEARCH_NAMES]
     assert sent["tool_choice"] == {"type": "function", "function": {"name": "lookup"}} and sent["max_tokens"] == 50
     assert [(r.status_code, r.json()["error"]["code"]) for r in errors] == [
         (400, "unsupported_parameter"), (400, "unsupported_tool"), (400, "invalid_request")]
@@ -512,14 +516,14 @@ async def test_responses_items(gateway, capsys):
     _, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
     lookup = {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
-    replies += [sse(tool_call("web_search", query="news"), finish="tool_calls"), sse({"content": "No search."}),
+    replies += [sse(tool_call("web_search", query=""), finish="tool_calls"), sse({"content": "No search."}),
                 sse(tool_call("lookup", q="x"), finish="tool_calls"), sse({"content": "Cut"}, finish="length"),
                 sse(tool_call("generate_image", prompt="fox"), finish="tool_calls"), httpx.Response(500, text="boom")]
     async with client(app) as request:
         searched, called, cut, failed = [(await respond(request, input="hi", **extra)).json()
                                          for extra in ({}, {"tools": [lookup]}, {}, {})]
     assert [item["type"] for item in searched["output"]] == ["web_search_call", "message"]
-    assert searched["output"][0]["status"] == "failed" and searched["output"][0]["action"]["query"] == "news"
+    assert searched["output"][0]["status"] == "failed" and searched["output"][0]["action"]["query"] == ""
     call = called["output"][-1]
     assert (call["type"], call["call_id"], call["name"], call["arguments"]) == ("function_call", "call_lookup", "lookup",
                                                                                 '{"q": "x"}')

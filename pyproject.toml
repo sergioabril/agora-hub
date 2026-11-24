@@ -3,10 +3,15 @@ name = "agora-hub"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+  "anyio",
   "asyncssh",
+  "beautifulsoup4",
   "fastapi",
   "httpx",
+  "playwright",
+  "pydantic",
   "pyyaml",
+  "starlette",
   "uvicorn",
 ]
 

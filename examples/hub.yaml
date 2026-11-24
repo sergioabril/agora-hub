@@ -32,3 +32,17 @@ timeouts:
   deployment_stop_seconds: 60
   readiness_poll_seconds: 5
   image_seconds: 300
+
+tools:
+  default_round_limit: 10
+  total_round_limit: 40
+  search:
+    enabled: true
+    round_limit: 30
+    time_limit_seconds: 180
+    action_timeout_seconds: 45
+    page_chars: 12000
+    engines: [bing, duckduckgo, google]
+    browser:
+      enabled: true
+      idle_seconds: 300

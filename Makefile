@@ -22,7 +22,7 @@ deploy: build
 	echo "agora-hub config: $$dir"
 	@echo "agora-hub public host: $(or $(PUBLIC_HOST),none)"
 	@docker rm -f agora-hub >/dev/null 2>&1 || true
-	docker run -d --restart unless-stopped --name agora-hub --log-opt max-size=20m --log-opt max-file=5 --publish 3333:3333 --publish 8888:8888 \
+	docker run -d --init --shm-size=1g --security-opt seccomp="$(CURDIR)/scripts/browser-seccomp.json" --restart unless-stopped --name agora-hub --log-opt max-size=20m --log-opt max-file=5 --publish 3333:3333 --publish 8888:8888 \
 	  --mount type=bind,src="$(CONFIG_DIR)",dst=/config agora-hub:local$(if $(PUBLIC_HOST), /app/.venv/bin/python -m agora_hub \
 	  --config-dir /config --host 0.0.0.0 --port 3333 --gateway-port 8888 --public-host $(PUBLIC_HOST))
 	@echo "agora-hub deployed on :3333 and :8888 (logs: docker logs -f agora-hub)"

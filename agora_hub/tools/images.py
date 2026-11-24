@@ -1,18 +1,12 @@
-import base64
-import hashlib
-import json
-import os
-import re
-import secrets
 from collections.abc import Callable
-from dataclasses import dataclass
-from pathlib import Path
+import base64
+import re
 
 import httpx
 
-FILES_PATH = "/files/"  # how the harness refers to a stored file in text; no route serves it
-MEDIA_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
-FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpg|webp)$")
+from .base import Call, ToolContext, ToolOutput, ToolError
+from .store import MEDIA_TYPES, FileStore
+
 VISION_NOTE = (
     "Images in this conversation are labelled [image_1], [image_2], … in order. You see the recent ones. An older one "
     'is marked "not attached": you cannot see it until you call view_image with its label, so call it before you '
@@ -31,10 +25,6 @@ VIEWED = "You can see {} now."  # the tool message of view_image: {} is the labe
 # about a tenth of that. For lossless images use {"output_format": "png", "output_compression": 1}: a third to a half
 # of the default size, and about 3 s more per image.
 IMAGE_OUTPUT = {"output_format": "jpeg", "output_compression": 95}
-SEARCH_NOTE = "To look something up on the web, call web_search."
-SEARCH_TODO = "TO BE IMPLEMENTED: web search isn't available yet. Answer without it and don't call it again."
-
-
 def spec(name: str, description: str, **properties) -> dict:
     parameters = {"type": "object", "properties": properties, "required": list(properties)}
     return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
@@ -52,90 +42,18 @@ IMAGE_SPECS = [
 VIEW_SPEC = spec("view_image", 'Look at images that are marked "not attached".',
                  images={"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4,
                          "description": 'Labels of the images, e.g. ["image_1"].'})
-SEARCH_SPEC = spec("web_search", "Search the web for current information.",
-                   query={"type": "string", "description": "What to search for."})
-KINDS = {"generate_image": ("image", "generate"), "edit_image": ("image", "edit"), "view_image": ("view", "view"),
-         "web_search": ("search", "search")}
 
 
-@dataclass
-class Call:
-    """One hub tool call, parsed once."""
+class ImageGroup:
+    id = "images"
+    actions = {
+        "generate_image": ("image", "generate"),
+        "edit_image": ("image", "edit"),
+        "view_image": ("view", "view"),
+    }
+    enabled = True
+    round_limit = None
 
-    id: str  # 32 random hex digits; Responses item ids and the generated image's file name use it
-    tool_call: dict  # the model's call: {"id", "type": "function", "function": {"name", "arguments"}}
-    kind: str  # "image", "view" or "search"
-    action: str  # "generate", "edit", "view" or "search"
-    text: str  # the prompt or the query; "" when the arguments don't give one
-    labels: list[str]  # edit and view: the image labels, in order; [] otherwise
-
-
-@dataclass
-class ToolContext:
-    images: list[str]  # file names by label: image_1 is images[0]; each name appears once
-
-    def label(self, name: str) -> str:
-        if name not in self.images:
-            self.images.append(name)
-        return f"image_{self.images.index(name) + 1}"
-
-
-@dataclass
-class ToolOutput:
-    content: str  # the tool message the model reads
-    images: list[str]  # FileStore names this call made or asked to see, attached for the model after the round
-
-
-class ToolError(Exception):
-    pass
-
-
-class FileStore:
-    def __init__(self, folder: Path):
-        self.folder = folder
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-    def save(self, data: bytes, stem: str | None = None) -> str:
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            ext = "png"
-        elif data.startswith(b"\xff\xd8\xff"):
-            ext = "jpg"
-        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            ext = "webp"
-        else:
-            raise ValueError("unsupported image type")
-        name = f"{stem or hashlib.sha256(data).hexdigest()[:32]}.{ext}"
-        if not (self.folder / name).exists():
-            self._write(name, data)
-        return name
-
-    def _write(self, name: str, data: bytes):
-        tmp = self.folder / f"{name}.tmp"
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
-            file.write(data)
-        os.replace(tmp, self.folder / name)
-
-    def save_call(self, stem: str, tool_call: dict):
-        """Keeps the tool call that made the image <stem>, next to it, so a later request can replay it."""
-        self._write(f"{stem}.json", json.dumps(tool_call).encode())
-
-    def call(self, stem: str) -> dict | None:
-        path = self.folder / f"{stem}.json"
-        return json.loads(path.read_bytes()) if re.fullmatch("[0-9a-f]{32}", stem) and path.is_file() else None
-
-    def path(self, name: str) -> Path | None:
-        path = self.folder / name
-        return path if FILE_NAME.match(name) and path.is_file() else None
-
-    def find(self, stem: str) -> str | None:
-        return next((f"{stem}.{ext}" for ext in MEDIA_TYPES if self.path(f"{stem}.{ext}")), None)
-
-    def data_url(self, name: str) -> str:
-        data = base64.b64encode(self.path(name).read_bytes()).decode()
-        return f"data:{MEDIA_TYPES[name.split('.')[1]]};base64,{data}"
-
-
-class Tools:
     def __init__(
         self,
         client: httpx.AsyncClient,
@@ -145,21 +63,25 @@ class Tools:
     ):
         self.client, self.store, self.image_target, self.timeout = client, store, image_target, timeout
 
-    def offer(self) -> tuple[list[dict], str]:
-        if self.image_target():
-            return [*IMAGE_SPECS, VIEW_SPEC, SEARCH_SPEC], "\n\n".join((VISION_NOTE, IMAGE_NOTE, SEARCH_NOTE))
-        return [VIEW_SPEC, SEARCH_SPEC], VISION_NOTE + "\n\n" + SEARCH_NOTE
+    @property
+    def schemas(self):
+        return [*IMAGE_SPECS, VIEW_SPEC] if self.image_target() else [VIEW_SPEC]
 
-    def call(self, tool_call: dict) -> Call:
-        function = tool_call["function"]
-        try:
-            args = json.loads(function["arguments"])
-        except ValueError:
-            args = {}
-        args = args if isinstance(args, dict) else {}
-        text, labels = args.get("prompt", args.get("query")), args.get("images")
-        return Call(secrets.token_hex(16), tool_call, *KINDS[function["name"]], text if isinstance(text, str) else "",
-                    [str(label) for label in labels] if isinstance(labels, list) else [])
+    @property
+    def note(self):
+        return VISION_NOTE + ("\n\n" + IMAGE_NOTE if self.image_target() else "")
+
+    async def prepare(self, call, context):
+        pass
+
+    def limit_reason(self, context):
+        return None
+
+    async def cleanup(self, context):
+        pass
+
+    async def close(self):
+        pass
 
     def _files(self, call: Call, context: ToolContext) -> list[str]:
         """The files a call's labels name. Any image of the conversation counts, attached for the model or not."""
@@ -174,8 +96,6 @@ class Tools:
         return files
 
     async def run(self, call: Call, context: ToolContext) -> ToolOutput:
-        if call.kind == "search":
-            raise ToolError(SEARCH_TODO)
         if call.kind == "view":
             files = self._files(call, context)
             return ToolOutput(VIEWED.format(", ".join(f"[{context.label(file)}]" for file in files)), files)
