@@ -7,7 +7,7 @@ import sqlite3
 import httpx
 import pytest
 
-from agora_hub.accounts import Accounts
+from agora_hub.accounts import Accounts, digest
 from agora_hub.api import create_app
 from agora_hub.config import DeploymentConfig, load_config
 from agora_hub.controller import Controller
@@ -140,9 +140,9 @@ def test_accounts_adds_device_alias_to_existing_database(tmp_path):
     accounts = Accounts(path)
     code = accounts.add("Bob")["invite_code"]
     accounts.link(code, "Bob's iPad")
-    old = accounts.db.execute("SELECT device_alias FROM user_tokens WHERE token_hash = 'old'").fetchone()
-    new = accounts.db.execute("SELECT device_alias FROM user_tokens WHERE token_hash != 'old'").fetchone()
-    assert old == ("",) and new == ("Bob's iPad",)
+    old, new = accounts.users()[0]["tokens"][0], accounts.users()[1]["tokens"][0]
+    assert old == {"device_alias": "", "created_at": "2026-01-01T00:00:00+00:00", "hash8": "old", "revoked": False}
+    assert new["device_alias"] == "Bob's iPad" and new["created_at"] > old["created_at"]
 
 
 async def test_accounts_link(gateway):
@@ -206,6 +206,8 @@ async def test_accounts_link(gateway):
         missing = await request.get("/agora/v1/me")
         unknown = await status("c" * 64)
         non_ascii = await request.get("/agora/v1/me", headers={"Authorization": "Bearer caf\u00e9".encode("latin-1")})
+        users = (await admin_request.get("/admin/accounts", headers=admin_headers)).json()["accounts"]
+        listed = next(user["tokens"] for user in users if user["id"] == ana)
     assert linked.status_code == 200 and re.fullmatch(r"[0-9a-f]{64}", token)
     assert linked.json()["user"] == me.json() == {"id": ana, "name": "Ana"}
     assert models == 200
@@ -223,6 +225,7 @@ async def test_accounts_link(gateway):
     aliases = accounts.db.execute(
         "SELECT device_alias FROM user_tokens WHERE user_id = ? ORDER BY rowid", (ana,)).fetchall()
     assert aliases == [("Ana's phone",), ("Ana's phone",)]
+    assert [(t["hash8"], t["revoked"]) for t in listed] == [(digest(token)[-8:], True), (digest(second)[-8:], True)]
     db = (config.config_dir / "agora.db").read_bytes()
     assert not [value for value in seen if value.encode() in db]
 

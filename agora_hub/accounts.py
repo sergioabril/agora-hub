@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS user_tokens (
   user_id      TEXT NOT NULL REFERENCES users,
   invite_id    TEXT NOT NULL UNIQUE REFERENCES user_invites,
   revoked      INTEGER NOT NULL DEFAULT 0,
-  device_alias TEXT NOT NULL);
+  device_alias TEXT NOT NULL,
+  created_at   TEXT NOT NULL);
 """
 
 
@@ -42,11 +43,18 @@ class Accounts:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.executescript(SCHEMA)
-        # Databases made before device_alias existed: tokens linked then have no alias.
+        # Older databases: tokens linked before device_alias get no alias, and before created_at get
+        # their invite's creation time, which is at most 10 minutes before the link.
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(user_tokens)")}
-        if "device_alias" not in columns:
-            with self.db:
+        with self.db:
+            if "device_alias" not in columns:
                 self.db.execute("ALTER TABLE user_tokens ADD COLUMN device_alias TEXT NOT NULL DEFAULT ''")
+            if "created_at" not in columns:
+                self.db.execute("ALTER TABLE user_tokens ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+                self.db.execute(
+                    "UPDATE user_tokens SET created_at ="
+                    " (SELECT created_at FROM user_invites WHERE id = user_tokens.invite_id)"
+                )
 
     def _invite(self, user_id: str) -> dict:
         code = secrets.token_hex(16)
@@ -68,8 +76,19 @@ class Accounts:
         return {"id": row[0], "name": row[1], "disabled": bool(row[2])} if row else None
 
     def users(self) -> list[dict]:
+        # Each user carries every token it redeemed, revoked ones too; hash8 is the stored hash's tail.
+        tokens: dict[str, list[dict]] = {}
+        for user_id, alias, created_at, hash_, revoked in self.db.execute(
+            "SELECT user_id, device_alias, created_at, token_hash, revoked FROM user_tokens ORDER BY created_at, rowid"
+        ):
+            tokens.setdefault(user_id, []).append(
+                {"device_alias": alias, "created_at": created_at, "hash8": hash_[-8:], "revoked": bool(revoked)}
+            )
         rows = self.db.execute("SELECT id, name, disabled FROM users ORDER BY created_at, rowid")
-        return [{"id": id_, "name": name, "disabled": bool(disabled)} for id_, name, disabled in rows]
+        return [
+            {"id": id_, "name": name, "disabled": bool(disabled), "tokens": tokens.get(id_, [])}
+            for id_, name, disabled in rows
+        ]
 
     def disable(self, user_id: str, disabled: bool) -> dict:
         with self.db:
@@ -105,8 +124,9 @@ class Accounts:
                 return None
             token = secrets.token_hex(32)
             self.db.execute(
-                "INSERT INTO user_tokens (token_hash, user_id, invite_id, device_alias) VALUES (?, ?, ?, ?)",
-                (digest(token), user_id, invite_id, device_alias),
+                "INSERT INTO user_tokens (token_hash, user_id, invite_id, device_alias, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (digest(token), user_id, invite_id, device_alias, now()),
             )
         return {"token": token, "user": {"id": user_id, "name": name}}
 

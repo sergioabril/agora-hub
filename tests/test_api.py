@@ -337,7 +337,7 @@ async def test_accounts_admin(api):
     assert re.fullmatch(r"[0-9a-f-]{36}", user_id) and re.fullmatch(r"[0-9a-f]{32}", new.json()["invite_code"])
     expires = datetime.fromisoformat(new.json()["expires_at"]) - datetime.now(timezone.utc)
     assert timedelta(minutes=9) < expires <= timedelta(minutes=10)
-    assert listed.json() == {"accounts": [{"id": user_id, "name": "Ana", "disabled": False}]}
+    assert listed.json() == {"accounts": [{"id": user_id, "name": "Ana", "disabled": False, "tokens": []}]}
     assert invite.status_code == 201 and invite.json()["invite_code"] != new.json()["invite_code"]
     assert disabled.json() == {"id": user_id, "name": "Ana", "disabled": True}
     assert listed_disabled.json()["accounts"][0]["disabled"] is True
