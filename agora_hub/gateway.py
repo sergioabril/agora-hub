@@ -53,13 +53,14 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
     files = FileStore(config.config_dir / "files")
     harness = Harness(client, Tools(client, files, image_target, config.hub.timeouts.image_seconds), files)
 
-    async def parse(request: Request, field: str = "model") -> dict:
+    async def parse(request: Request, *fields: str) -> dict:
         try:
             body = json.loads(await request.body())
         except ValueError:
             body = None
-        if not isinstance(body, dict) or not isinstance(body.get(field), str):
-            raise GatewayError(400, "invalid_request", f"body must be a JSON object with a string {field}")
+        for field in fields or ("model",):
+            if not isinstance(body, dict) or not isinstance(body.get(field), str):
+                raise GatewayError(400, "invalid_request", f"body must be a JSON object with a string {field}")
         return body
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -74,8 +75,11 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
 
     @app.post("/agora/v1/link")
     async def link(request: Request):
-        body = await parse(request, "code")
-        if linked := accounts.link(body["code"]):
+        body = await parse(request, "code", "device_alias")
+        device_alias = body["device_alias"].strip()
+        if not device_alias:
+            raise GatewayError(400, "invalid_request", "device_alias must not be blank")
+        if linked := accounts.link(body["code"], device_alias):
             return linked
         raise GatewayError(400, "invalid_invite", "invite code is invalid, expired or already used")
 

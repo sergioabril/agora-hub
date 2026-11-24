@@ -19,10 +19,11 @@ CREATE TABLE IF NOT EXISTS user_invites (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS user_tokens (
-  token_hash TEXT PRIMARY KEY,
-  user_id    TEXT NOT NULL REFERENCES users,
-  invite_id  TEXT NOT NULL UNIQUE REFERENCES user_invites,
-  revoked    INTEGER NOT NULL DEFAULT 0);
+  token_hash   TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL REFERENCES users,
+  invite_id    TEXT NOT NULL UNIQUE REFERENCES user_invites,
+  revoked      INTEGER NOT NULL DEFAULT 0,
+  device_alias TEXT NOT NULL);
 """
 
 
@@ -41,6 +42,11 @@ class Accounts:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.executescript(SCHEMA)
+        # Databases made before device_alias existed: tokens linked then have no alias.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(user_tokens)")}
+        if "device_alias" not in columns:
+            with self.db:
+                self.db.execute("ALTER TABLE user_tokens ADD COLUMN device_alias TEXT NOT NULL DEFAULT ''")
 
     def _invite(self, user_id: str) -> dict:
         code = secrets.token_hex(16)
@@ -82,7 +88,7 @@ class Accounts:
             self.db.execute("UPDATE user_invites SET consumed = 1 WHERE user_id = ? AND consumed = 0", (user_id,))
         return revoked
 
-    def link(self, code: str) -> dict | None:
+    def link(self, code: str, device_alias: str) -> dict | None:
         with self.db:
             row = self.db.execute(
                 "SELECT i.id, u.id, u.name FROM user_invites i JOIN users u ON u.id = i.user_id"
@@ -99,8 +105,8 @@ class Accounts:
                 return None
             token = secrets.token_hex(32)
             self.db.execute(
-                "INSERT INTO user_tokens (token_hash, user_id, invite_id) VALUES (?, ?, ?)",
-                (digest(token), user_id, invite_id),
+                "INSERT INTO user_tokens (token_hash, user_id, invite_id, device_alias) VALUES (?, ?, ?, ?)",
+                (digest(token), user_id, invite_id, device_alias),
             )
         return {"token": token, "user": {"id": user_id, "name": name}}
 

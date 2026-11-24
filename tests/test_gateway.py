@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import re
+import sqlite3
 
 import httpx
 import pytest
@@ -46,7 +47,7 @@ def gateway(config_dir, monkeypatch):
     controller = Controller(config, adapters)
     requests, replies = [], []
     accounts = Accounts(config_dir / "agora.db")
-    token = accounts.link(accounts.add("Test")["invite_code"])["token"]
+    token = accounts.link(accounts.add("Test")["invite_code"], "Test device")["token"]
     monkeypatch.setitem(KEY, "Authorization", "Bearer " + token)
     app = create_gateway(config, controller, accounts, upstream(requests, replies))
     return config, adapters, controller, app, requests, replies
@@ -115,6 +116,35 @@ async def test_auth_and_models(gateway):
     assert embeddings.json()["error"]["message"].startswith("POST /openai/v1/embeddings is not served; the gateway serves GET")
 
 
+def test_accounts_adds_device_alias_to_existing_database(tmp_path):
+    path = tmp_path / "agora.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE users (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, disabled INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE user_invites (
+          id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users, code_hash TEXT NOT NULL UNIQUE,
+          consumed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+        CREATE TABLE user_tokens (
+          token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users,
+          invite_id TEXT NOT NULL UNIQUE REFERENCES user_invites, revoked INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO users VALUES ('u1', 'Ana', '2026-01-01T00:00:00+00:00', 0);
+        INSERT INTO user_invites
+          VALUES ('i1', 'u1', 'unused', 1, '2026-01-01T00:00:00+00:00', '2027-01-01T00:00:00+00:00');
+        INSERT INTO user_tokens VALUES ('old', 'u1', 'i1', 0);
+        """
+    )
+    db.commit()
+    db.close()
+    accounts = Accounts(path)
+    code = accounts.add("Bob")["invite_code"]
+    accounts.link(code, "Bob's iPad")
+    old = accounts.db.execute("SELECT device_alias FROM user_tokens WHERE token_hash = 'old'").fetchone()
+    new = accounts.db.execute("SELECT device_alias FROM user_tokens WHERE token_hash != 'old'").fetchone()
+    assert old == ("",) and new == ("Bob's iPad",)
+
+
 async def test_accounts_link(gateway):
     config, _, _, app, _, _ = gateway
     accounts = Accounts(config.config_dir / "agora.db")
@@ -137,7 +167,7 @@ async def test_accounts_link(gateway):
             return code
 
         async def link(code):
-            reply = await request.post("/agora/v1/link", json={"code": code})
+            reply = await request.post("/agora/v1/link", json={"code": code, "device_alias": "Ana's phone"})
             if reply.status_code == 200:
                 seen.append(reply.json()["token"])
             return reply
@@ -148,6 +178,9 @@ async def test_accounts_link(gateway):
         ana, code = await new("Ana")
         linked = await link(code)
         token = linked.json()["token"]
+        alias_code = await invite(ana)
+        no_alias = await request.post("/agora/v1/link", json={"code": alias_code})
+        blank_alias = await request.post("/agora/v1/link", json={"code": alias_code, "device_alias": "  "})
         me = await request.get("/agora/v1/me", headers=bearer(token))
         models = await status(token, "/openai/v1/models")
         reused = await link(code)
@@ -179,10 +212,17 @@ async def test_accounts_link(gateway):
     assert [(r.status_code, r.json()["error"]["code"]) for r in (reused, expired, no_code)] == [
         (400, "invalid_invite"), (400, "invalid_invite"), (400, "invalid_request")]
     assert both == [200, 200]
+    assert [(r.status_code, r.json()["error"]["code"]) for r in (no_alias, blank_alias)] == [
+        (400, "invalid_request"), (400, "invalid_request")]
+    assert no_alias.json()["error"]["message"] == "body must be a JSON object with a string device_alias"
+    assert blank_alias.json()["error"]["message"] == "device_alias must not be blank"
     assert revoked.json() == {"revoked": 2}
     assert after_revoke == [401, 401, 400]
     assert while_disabled == [401, 400] and enabled == 200
     assert missing.status_code == unknown == non_ascii.status_code == 401
+    aliases = accounts.db.execute(
+        "SELECT device_alias FROM user_tokens WHERE user_id = ? ORDER BY rowid", (ana,)).fetchall()
+    assert aliases == [("Ana's phone",), ("Ana's phone",)]
     db = (config.config_dir / "agora.db").read_bytes()
     assert not [value for value in seen if value.encode() in db]
 

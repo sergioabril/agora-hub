@@ -204,7 +204,7 @@ Every `/openai/v1` route and `GET /agora/v1/me` require `Authorization: Bearer <
 
 | Method and path | Auth | What it does |
 | --- | --- | --- |
-| `POST /agora/v1/link` | none | Body `{"code":"<invite code>"}`. Returns `200 {"token", "user": {"id", "name"}}`, `400 invalid_request`, or `400 invalid_invite` (invalid, expired or already used). |
+| `POST /agora/v1/link` | none | Body `{"code":"<invite code>", "device_alias":"<device name>"}`; both are required strings, and `device_alias` can't be blank. Returns `200 {"token", "user": {"id", "name"}}`, `400 invalid_request`, or `400 invalid_invite` (invalid, expired or already used). |
 | `GET /agora/v1/me` | token | `200 {"id", "name"}`: the token's user. |
 | `GET /openai/v1/models` | token | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
 | `POST /openai/v1/chat/completions` | token | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
@@ -227,12 +227,13 @@ curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 ### Accounts
 
-The admin creates a user and gets an invite code, valid once for 10 minutes. The client redeems it at `/agora/v1/link` on the gateway port for a token. The token is shown once; the hub stores only its SHA-256. `revoke` cuts off all of a user's tokens and unused invites; a new invite then gives a new token. Disabling pauses a user, and enabling brings back their tokens that weren't revoked. Revoking is for good.
+The admin creates a user and gets an invite code, valid once for 10 minutes. The client redeems it at `/agora/v1/link` on the gateway port for a token, naming the device it links in `device_alias`. The token is shown once; the hub stores only its SHA-256, next to that alias. `revoke` cuts off all of a user's tokens and unused invites; a new invite then gives a new token. Disabling pauses a user, and enabling brings back their tokens that weren't revoked. Revoking is for good.
 
 ```sh
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"Ana"}' http://localhost:3333/admin/accounts/new     # {"id", "invite_code", "expires_at"}
-curl -X POST -H 'Content-Type: application/json' -d '{"code":"<invite_code>"}' \
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"code":"<invite_code>","device_alias":"iPhone"}' \
   http://localhost:8888/agora/v1/link                               # {"token", "user": {"id", "name"}}
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8888/agora/v1/me
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
