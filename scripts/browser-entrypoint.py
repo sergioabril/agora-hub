@@ -19,6 +19,8 @@ if os.geteuid() == 0:
     home.mkdir(mode=0o700, exist_ok=True)
     os.chown(home, uid, gid)
     os.environ['HOME'] = str(home)
+    # The UID has no /etc/passwd entry; asyncssh reads the local user name from the environment instead.
+    os.environ['USER'] = os.environ['LOGNAME'] = 'agora'
     os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)
