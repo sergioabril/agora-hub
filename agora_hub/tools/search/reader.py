@@ -45,28 +45,43 @@ def web_url(base, value):
     return url if parts.scheme in ("http", "https") and parts.hostname and not parts.username and not parts.password else None
 
 
+def image_url(base, img):
+    # Lazy-loading pages put a data: placeholder in src and the real address in data-src or srcset.
+    srcset = (img.get("srcset") or img.get("data-srcset") or "").split(",")[0].split()
+    for value in (img.get("data-agora-current-src"), img.get("src"), img.get("data-src"), img.get("data-lazy-src"),
+                  srcset[0] if srcset else None):
+        if url := web_url(base, value):
+            return url
+    return None
+
+
 def extract(html: str, requested: str, final: str, mode: str, status_code=200) -> Snapshot:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(" ", strip=True)[:300] if soup.title else ""
     base_tag = soup.find("base", href=True)
     base = web_url(final, base_tag.get("href")) if base_tag else final
     base = base or final
-    for tag in soup(["script", "style", "noscript", "template", "svg", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-    for tag in list(soup.select('[hidden], [aria-hidden="true"], input[type="hidden"]')):
-        tag.decompose()
-    for tag in list(soup.find_all(style=True)):
-        if re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", tag.get("style", ""), re.I):
+    for tag in soup(["script", "style", "noscript", "template", "svg", "nav", "aside", "header", "footer"]):
+        # Site headers and footers are boilerplate; an article's own header holds its title, byline and date.
+        if not tag.decomposed and not (tag.name in ("header", "footer") and tag.find_parent(["article", "main"])):
             tag.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
+    for tag in list(soup.select('[hidden], [aria-hidden="true"], input[type="hidden"]')):
+        if not tag.decomposed:
+            tag.decompose()
+    for tag in list(soup.find_all(style=True)):
+        # A hidden ancestor removed earlier in this loop also removed this tag.
+        if not tag.decomposed and re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", tag.get("style", ""), re.I):
+            tag.decompose()
+    # One article is the page's content; several (a listing, search results, a feed) are read together.
+    articles = [a for a in soup.find_all("article") if not a.find_parent("article")]
+    root = (articles[0] if len(articles) == 1 else None) or soup.find("main") or soup.body or soup
     links, images = [], []
     for a in root.find_all("a", href=True):
         url = web_url(base, a["href"])
         if url:
             links.append(Reference(url, a.get_text(" ", strip=True)[:240]))
     for img in soup.find_all("img"):
-        url = web_url(base, img.get("data-agora-current-src") or img.get("src") or img.get("data-src"))
-        if url:
+        if url := image_url(base, img):
             images.append(Reference(url, str(img.get("alt", ""))[:240]))
     for row in root.find_all("tr"):
         row.replace_with("\n" + " | ".join(c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])) + "\n")
@@ -152,12 +167,13 @@ def render(page, offset=0, cap=12000, attempts=()):
                   offset=offset, next_offset=None, text="", links=[], images=[],
                   omitted_chars=page.omitted_chars, omitted_links=page.omitted_links,
                   omitted_images=page.omitted_images, attempts=list(attempts))
-    # Reserve text room; metadata is bounded independently, including hostile long URLs.
-    for key, refs, prefix in (("links", page.links, "l"), ("images", page.images, "i")):
+    # Reserve text room; metadata is bounded independently, including hostile long URLs. Links stop at 3/8 of the
+    # result so that image references always get room too, up to half of it in all.
+    for key, refs, prefix, limit in (("links", page.links, "l", cap * 3 // 8), ("images", page.images, "i", cap // 2)):
         for i, ref in enumerate(refs, 1):
             entry = dict(ref=f"{page.id}:{prefix}{i}", url=ref.url, text=ref.text)
             result[key].append(entry)
-            if len(json.dumps(result, ensure_ascii=False)) > cap // 2:
+            if len(json.dumps(result, ensure_ascii=False)) > limit:
                 result[key].pop()
                 break
         result[f"omitted_{key}"] += len(refs) - len(result[key])

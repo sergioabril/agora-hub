@@ -23,6 +23,7 @@ class ToolContext:
     state: dict[str, Any] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
     total_actions: int = 0
+    request_id: str | None = None  # the response being answered, for tool traces
 
     def label(self, name: str) -> str:
         if name not in self.images:

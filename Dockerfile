@@ -3,7 +3,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /usr/local/bin/uv
 ENV UV_PYTHON_DOWNLOADS=never PLAYWRIGHT_BROWSERS_PATH=/opt/agora-browsers PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project --no-cache \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 \
+ && uv sync --locked --no-dev --no-install-project --no-cache \
  && /app/.venv/bin/python -m playwright install --with-deps --only-shell chromium \
  && chmod -R a+rX /opt/agora-browsers \
  && rm -rf /var/lib/apt/lists/* /root/.cache

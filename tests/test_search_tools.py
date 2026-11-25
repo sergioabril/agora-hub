@@ -169,3 +169,15 @@ async def test_screenshot_can_be_reviewed_but_never_published(tmp_path):
     finally:
         await group.cleanup(context)
         await group.close()
+
+
+async def test_null_optional_arguments_are_ignored(group):
+    context = ToolContext([])
+    try:
+        page = json.loads((await group.run(call('open_page', url='https://example.org/one', ref=None, mode=None,
+                                                offset=None), context)).content)
+        assert page['access_status'] == 'content'
+        again = json.loads((await group.run(call('open_page', url='', ref=page['snapshot']), context)).content)
+        assert again['snapshot'] == page['snapshot']
+    finally:
+        await group.cleanup(context)

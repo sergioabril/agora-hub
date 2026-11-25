@@ -9,7 +9,6 @@ from contextlib import suppress
 from dataclasses import replace
 import ipaddress
 from http.cookiejar import CookieJar, DefaultCookiePolicy
-import logging
 import socket
 import time
 import zlib
@@ -17,14 +16,18 @@ from urllib.parse import urlsplit
 
 import httpx
 import anyio
+from bs4 import UnicodeDammit
 
+from ...trace import trace
 from .reader import extract
 
-log = logging.getLogger(__name__)
 HTML_CAP = 5 * 1024 * 1024
 IMAGE_CAP = 8 * 1024 * 1024
 SCREENSHOT_CAP = 2 * 1024 * 1024
 DOM_CAP = 2_000_000
+# Sent by HTTP and the browser alike. Wikimedia rejects agents without contact details, and also rejects browser
+# agents (Safari, Chrome) whose TLS fingerprint doesn't match, so the hub names itself honestly.
+USER_AGENT = "AgoraAgent/1.0 (+https://abril.me)"
 
 
 class NoWebCookies(DefaultCookiePolicy):
@@ -155,8 +158,7 @@ class PinnedProxy:
                     await asyncio.gather(*flows, return_exceptions=True)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            log.debug("Web transport rejected: %s", type(exc).__name__)
+        except Exception:
             with suppress(Exception):
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 27\r\nConnection: close\r\n\r\nDestination policy rejected")
                 await writer.drain()
@@ -268,7 +270,8 @@ class Browser:
             # Keep that operation alive on cancellation, then close the acquired
             # resource before releasing its slot (also under ASGI cancellation).
             creating = asyncio.create_task(self.process.new_context(
-                service_workers="block", accept_downloads=False, viewport={"width":1280,"height":900}))
+                service_workers="block", accept_downloads=False, viewport={"width":1280,"height":900},
+                user_agent=USER_AGENT))
             try:
                 context = await asyncio.shield(creating)
             except BaseException:
@@ -399,7 +402,7 @@ class Loader:
                 self.client = httpx.AsyncClient(proxy=None if self.transport else await self.proxy.start(),
                     transport=self.transport, trust_env=False, timeout=15, follow_redirects=False,
                     cookies=CookieJar(policy=NoWebCookies()),
-                    headers={"User-Agent":"AgoraResearch/1.0", "Accept":"text/html,text/plain,image/*;q=0.8", "Accept-Encoding":"gzip, deflate, identity"})
+                    headers={"User-Agent":USER_AGENT, "Accept":"text/html,text/plain,image/*;q=0.8", "Accept-Encoding":"gzip, deflate, identity"})
             return self.client
 
     async def fetch(self, url, cap=HTML_CAP, image=False):
@@ -444,7 +447,7 @@ class Loader:
                     chunks.append(chunk)
                 if decoder and (not decoder.eof or decoder.unused_data):
                     raise AccessError("Incomplete or concatenated compressed response")
-                return b"".join(chunks), str(response.url), response.status_code, mime
+                return b"".join(chunks), str(response.url), response.status_code, mime, response.charset_encoding
         raise AccessError("Redirect limit exceeded")
 
     async def load(self, state, url, mode="auto"):
@@ -456,20 +459,21 @@ class Loader:
         if mode != "browser":
             started = time.monotonic()
             try:
-                data, final, code, mime = await self.fetch(url)
+                data, final, code, mime, charset = await self.fetch(url)
+                # The header's charset wins; otherwise the page's <meta charset>, then UTF-8, then Windows-1252.
+                text = UnicodeDammit(data, [charset] if charset else [], is_html=True).unicode_markup
+                text = text if text is not None else data.decode("utf-8", "replace")
                 if mime == "text/plain":
                     import html
-                    data = ("<pre>" + html.escape(data.decode("utf-8", "replace")) + "</pre>").encode()
-                page = extract(data.decode("utf-8", "replace"), url, final, "http", code)
+                    text = "<pre>" + html.escape(text) + "</pre>"
+                page = extract(text, url, final, "http", code)
                 attempts.append({"mode":"http", "status":page.status})
-                log.info("Web fetch mode=http status=%s duration=%.2f", page.status, time.monotonic()-started)
             except UnsupportedDocument as exc:
                 page = replace(extract("", url, exc.url, "http"), status="unsupported", detail=str(exc))
                 attempts.append({"mode":"http", "status":"unsupported", "detail":str(exc)[:300]})
-                log.info("Web fetch mode=http status=unsupported duration=%.2f", time.monotonic()-started)
             except (AccessError, httpx.HTTPError, OSError, TimeoutError) as exc:
                 attempts.append({"mode":"http", "status":"error", "detail":str(exc)[:300]})
-                log.info("Web fetch mode=http status=error duration=%.2f", time.monotonic()-started)
+            self._trace(state, url, attempts[-1]["status"], "http", started)
             if page and (page.status in ("content", "unsupported") or mode == "http"):
                 return page, attempts
         if mode != "http" and self.browser_enabled:
@@ -477,18 +481,23 @@ class Loader:
                 started = time.monotonic()
                 page = await self.browser.load(state, url)
                 attempts.append({"mode":"browser", "status":page.status})
-                log.info("Web fetch mode=browser status=%s duration=%.2f", page.status, time.monotonic()-started)
+                self._trace(state, url, page.status, "browser", started)
                 return page, attempts
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 attempts.append({"mode":"browser", "status":"error", "detail":str(exc)[:300]})
-                log.info("Web fetch mode=browser status=error duration=%.2f", time.monotonic()-started)
+                self._trace(state, url, "error", "browser", started)
         elif mode == "browser":
             raise AccessError("Browser rendering is disabled")
         if page:
             return replace(page, detail=str(attempts)[-700:]), attempts
         raise AccessError("Loading failed: " + str(attempts)[-1000:])
+
+    @staticmethod
+    def _trace(state, url, status, mode, started):
+        trace(getattr(state, "request_id", None), "web.fetch", mode=mode, status=status,
+              seconds=round(time.monotonic() - started, 3), url=url[:300])
 
     async def cleanup(self, state):
         await self.browser.cleanup(state)

@@ -60,3 +60,28 @@ def test_failed_snapshots_cannot_evict_last_successful_current():
         pages.add(replace(first,status='blocked'))
     assert pages.current == first.id and pages.resolve(first.id) == first
     assert len(pages.items) == 30
+
+
+def test_hidden_parent_with_styled_child():
+    page = extract('<main><p>Visible text that is long enough to count as readable page content in this small test page.</p>'
+                   '<div style="display:none"><span style="color:red">secret</span></div></main>',
+                   'https://example.org', 'https://example.org', 'http')
+    assert page.status == 'content' and 'secret' not in page.text
+
+
+def test_listing_articles_article_header_and_lazy_images():
+    filler = 'Readable sentence for the extraction length check. ' * 3
+    page = extract('<header>Site menu</header><article><h2>Repo one</h2><p>' + filler + '</p></article>'
+                   '<article><header><h1>Repo two</h1><time>24 Nov 2026</time></header><p>' + filler + '</p></article>'
+                   '<img src="data:image/gif;base64,R0lGOD" data-src="/real.jpg"><img srcset="/a.png 1x, /b.png 2x">',
+                   'https://example.org', 'https://example.org', 'http')
+    assert 'Repo one' in page.text and 'Repo two' in page.text and '24 Nov 2026' in page.text
+    assert 'Site menu' not in page.text
+    assert [i.url for i in page.images] == ['https://example.org/real.jpg', 'https://example.org/a.png']
+
+
+def test_image_references_get_room_beside_many_links():
+    html = '<main><p>' + 'Text. ' * 50 + '</p>' + ''.join(f'<a href="/story/{i}">Story {i}</a>' for i in range(200)) \
+        + ''.join(f'<img src="/photo/{i}.jpg" alt="Photo {i}">' for i in range(50)) + '</main>'
+    result = json.loads(render(Pages().add(extract(html, 'https://example.org', 'https://example.org', 'http'))))
+    assert result["links"] and result["images"] and len(json.dumps(result, ensure_ascii=False)) <= 12000

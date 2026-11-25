@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import json
 
 import httpx
 import pytest
@@ -162,7 +163,7 @@ async def test_unsupported_document_is_honest_snapshot_without_browser():
         await loader.close()
 
 
-async def test_browser_logging_includes_duration_and_access_status(caplog):
+async def test_browser_logging_includes_duration_and_access_status(capsys):
     from agora_hub.tools.search.reader import extract
     class FakeBrowser:
         async def load(self,state,url):
@@ -170,8 +171,22 @@ async def test_browser_logging_includes_duration_and_access_status(caplog):
         async def close(self): pass
     loader = Loader(browser=FakeBrowser())
     try:
-        with caplog.at_level('INFO',logger='agora_hub.tools.search.loader'):
-            await loader.load(object(),'https://example.org','browser')
-        assert any('mode=browser status=content duration=' in record.message for record in caplog.records)
+        await loader.load(object(),'https://example.org','browser')
+        line = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert (line['event'], line['mode'], line['status']) == ('web.fetch', 'browser', 'content') and 'seconds' in line
+    finally:
+        await loader.close()
+
+
+async def test_declared_charset_and_agent():
+    seen = []
+    def fixture(request):
+        seen.append(request.headers['user-agent'])
+        return httpx.Response(200, headers={'content-type': 'text/html; charset=iso-8859-1'},
+                              content=('<main>' + 'Año, España y café. ' * 10 + '</main>').encode('latin-1'))
+    loader = Loader(transport=httpx.MockTransport(fixture), browser_enabled=False)
+    try:
+        page, _ = await loader.load(object(), 'https://example.org', 'http')
+        assert 'Año, España y café.' in page.text and seen == ['AgoraAgent/1.0 (+https://abril.me)']
     finally:
         await loader.close()

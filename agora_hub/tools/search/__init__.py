@@ -71,6 +71,7 @@ ARGUMENTS = {
 
 @dataclass
 class State:
+    request_id: str | None = None  # the response these pages belong to, for web.fetch traces
     started: float = field(default_factory=time.monotonic)
     pages: Pages = field(default_factory=Pages)
     images: dict = field(default_factory=dict)  # ref/label -> (filename, source page, image URL)
@@ -163,6 +164,12 @@ def validate_image(data, mime):
         raise AccessError("Image dimensions exceed limit")
 
 
+def arguments(call):
+    # Models often send an optional argument as null, or an optional string as "": treat it as left out.
+    return {key: value for key, value in call.args.items()
+            if value is not None and not (value == "" and key in ("url", "ref", "engine", "mode", "scroll"))}
+
+
 class SearchGroup:
     id = "search"
     actions = {name: ("search", name) for name in ARGUMENTS}
@@ -199,7 +206,7 @@ class SearchGroup:
         return None
 
     async def prepare(self, call, context):
-        args = call.args
+        args = arguments(call)
         name = call.tool_call["function"]["name"]
         action = {"type":name}
         for key in ("query", "url", "ref", "offset", "scroll", "images", "image"):
@@ -222,7 +229,7 @@ class SearchGroup:
     async def run(self, call, context):
         state = context.state.get(self.id)
         if state is None:
-            state = context.state[self.id] = State()
+            state = context.state[self.id] = State(context.request_id)
         remaining = self.config.time_limit_seconds - (time.monotonic()-state.started)
         if remaining <= 0:
             raise ToolError(self.limit_reason(context))
@@ -243,7 +250,7 @@ class SearchGroup:
             raise ToolError(str(exc)[:1600]) from exc
 
     async def _run(self, call, context, state):
-        args = call.args
+        args = arguments(call)
         name = call.tool_call["function"]["name"]
         if name not in ARGUMENTS:
             raise ValueError("Unknown search function")
@@ -347,7 +354,7 @@ class SearchGroup:
                     data = path.read_bytes()
                 else:
                     source, image = state.pages.resolve(canonical, "i")
-                    data, _, _, mime = await self.loader.fetch(image.url, IMAGE_CAP, image=True)
+                    data, _, _, mime, _ = await self.loader.fetch(image.url, IMAGE_CAP, image=True)
                     validate_image(data, mime)
                     source_url, image_url = source.final_url, image.url
                     filename = self.store.save(data)

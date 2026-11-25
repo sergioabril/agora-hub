@@ -164,7 +164,7 @@ class Harness:
 
     async def start(self, body: dict, url: str, request_id: str) -> Turn:
         client_tools = body.get("tools") or []
-        turn = Turn(body, url, request_id, ToolContext([]), [], client_tools, self.tools)
+        turn = Turn(body, url, request_id, ToolContext([], request_id=request_id), [], client_tools, self.tools)
         number, seen = 0, {}  # turn number -> the images that turn refers to; a user message starts a turn
         for message in body["messages"]:
             number += message.get("role") == "user"
