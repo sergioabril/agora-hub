@@ -159,7 +159,7 @@ async def test_real_search_group_http_progress_image_and_offline_replay(tmp_path
         shown = result['output'][3]
         assert shown['type'] == 'web_image_call' and shown['source_page_url'] == 'https://example.org/article'
         assert shown['result'] == base64.b64encode(png).decode()
-        assert fetched == ['https://www.bing.com/search?q=facts', 'https://example.org/article', 'https://example.org/photo.png']
+        assert fetched == ['https://html.duckduckgo.com/html/?q=facts','https://example.org/article', 'https://example.org/photo.png']
         replay = chat_request({'model': 'm', 'input': [{'type': 'web_image_call', 'id': shown['id'], 'status': 'completed'}]}, tools.store)
         assert replay['messages'][0]['tool_calls'][0]['function']['name'] == 'show_web_image'
         assert 'https://example.org/photo.png' in replay['messages'][1]['content']

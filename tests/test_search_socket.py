@@ -55,7 +55,7 @@ class FixtureLoader(Loader):
         self.cleaned = asyncio.Event()
 
     async def load(self, state, url, mode='auto'):
-        if url.startswith('https://www.bing.com/search?'):
+        if url.startswith('https://html.duckduckgo.com/html/?'):
             url = self.base + '/search'
         return await super().load(state, url, mode)
 

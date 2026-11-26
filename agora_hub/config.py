@@ -106,7 +106,7 @@ class SearchConfig(Model):
     time_limit_seconds: PositiveFloat = Field(default=180, allow_inf_nan=False)
     action_timeout_seconds: PositiveFloat = Field(default=45, allow_inf_nan=False)
     page_chars: int = Field(default=12000, ge=1000, le=120000)
-    engines: list[Literal["bing", "duckduckgo", "google"]] = Field(default_factory=lambda: ["bing", "duckduckgo", "google"])
+    engines: list[Literal["duckduckgo", "bing", "google"]] = Field(default_factory=lambda: ["duckduckgo"])
     browser: SearchBrowserConfig = Field(default_factory=SearchBrowserConfig)
 
     @field_validator("engines")

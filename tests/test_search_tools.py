@@ -38,7 +38,9 @@ def fixture(request):
 
 @pytest.fixture
 def group(tmp_path):
-    return SearchGroup(SearchConfig(browser={'enabled':False}),FileStore(tmp_path),transport=httpx.MockTransport(fixture))
+    # Bing first so the search test covers fallback: the fixture's Bing page is a block page.
+    config = SearchConfig(engines=['bing', 'duckduckgo'], browser={'enabled':False})
+    return SearchGroup(config,FileStore(tmp_path),transport=httpx.MockTransport(fixture))
 
 
 async def test_search_follow_two_links_revisit_paginate_direct_and_publish(group):

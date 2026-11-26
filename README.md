@@ -97,7 +97,7 @@ tools:
     time_limit_seconds: 180
     action_timeout_seconds: 45
     page_chars: 12000
-    engines: [bing, duckduckgo, google]
+    engines: [duckduckgo]
     browser:
       enabled: true
       idle_seconds: 300
@@ -105,7 +105,7 @@ tools:
 
 `gateway.port` must differ from `api.port`. `timeouts.image_seconds` bounds one image generation or edit.
 
-The entire `tools` block and its nested fields are optional with the defaults above. `engines` must be nonempty, distinct and drawn from `bing`, `duckduckgo`, `google`; order is fallback order unless a call selects one engine. Limits must be positive and finite; action limits are integers 1–1000 and `page_chars` is 1000–120000. The browser path is resolved by Playwright, with no host executable/profile setting.
+The entire `tools` block and its nested fields are optional with the defaults above. `engines` must be nonempty, distinct and drawn from `duckduckgo`, `bing`, `google`; order is fallback order unless a call selects one engine. Only `duckduckgo` (its plain HTML page, `html.duckduckgo.com/html/`) gives useful results to the hub: Bing answers non-browser clients with results for the query's first word only, and Google, from the EU, with its cookie page. Both still count as readable pages, so as fallbacks they would hand the model junk instead of an error. Limits must be positive and finite; action limits are integers 1–1000 and `page_chars` is 1000–120000. The browser path is resolved by Playwright, with no host executable/profile setting.
 
 For HTTP-only research set `tools.search.browser.enabled: false`: `web_look` is omitted, while searching, reading and web-image tools remain available; explicit `mode: browser` reports disabled. To disable the entire family and its instruction note, set `tools.search.enabled: false`. Restart the hub after editing YAML. Browser startup failure leaves HTTP usable and returns the actual rendering limitation.
 
@@ -356,7 +356,7 @@ The harness automatically offers research tools and instructions to verify chang
 
 | Function | Arguments | Result/use |
 | --- | --- | --- |
-| `web_search` | Required `query` (nonempty, at most 2000 characters); optional `engine` (`bing`, `duckduckgo`, `google`), `mode` | Fresh ordinary search-page fetch, readable text, links and available image references; configured engine fallback when access fails. |
+| `web_search` | Required `query` (nonempty, at most 2000 characters); optional `engine` (`duckduckgo`, `bing`, `google`), `mode` | Fresh ordinary search-page fetch, readable text, links and available image references; configured engine fallback when access fails. |
 | `open_page` | Exactly one of `url` or `ref`; optional nonnegative integer `offset` (default `0`), `mode` | Direct URL, discovered link, cached revisit or next text segment. |
 | `web_look` | Optional `scroll`: `current` (default), `down`, `up` | Render the current readable page and attach a viewport JPEG for model inspection; updated snapshot. |
 | `view_web_images` | Required `images`: 1–4 page image references or previously viewed web-image labels | Download/validate and attach image pixels as `[image_N]` for the next model round. |

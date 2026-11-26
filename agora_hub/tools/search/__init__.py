@@ -12,9 +12,11 @@ from ..base import ToolError, ToolOutput
 from .loader import AccessError, IMAGE_CAP, Loader
 from .reader import Pages, render
 
+# DuckDuckGo's plain HTML page works without a browser. Bing answers non-browser clients with results for the
+# query's first word only, and Google with its EU cookie page, so they are not in the default config.
 ENGINES = {
+    "duckduckgo": "https://html.duckduckgo.com/html/?q={}",
     "bing": "https://www.bing.com/search?q={}",
-    "duckduckgo": "https://duckduckgo.com/?q={}",
     "google": "https://www.google.com/search?q={}",
 }
 MODE = {"type": "string", "enum": ["auto", "http", "browser"], "default": "auto"}
