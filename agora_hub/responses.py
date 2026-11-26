@@ -13,6 +13,7 @@ from .trace import trace
 UNSUPPORTED = ("previous_response_id", "conversation", "background")
 HUB_TOOLS = {"web_search", "web_search_preview", "image_generation"}  # the hub's own tools are on anyway
 FORMATS = {"png": "png", "jpg": "jpeg", "webp": "webp"}
+HUB_ITEMS = {"reasoning", "web_search_call", "image_generation_call", "web_image_call", "function_call"}
 ECHOED = {"instructions": None, "tools": [], "tool_choice": "auto", "parallel_tool_calls": True, "temperature": None,
           "top_p": None, "max_output_tokens": None, "metadata": {}}
 
@@ -127,15 +128,37 @@ def chat_request(body: dict, store: FileStore) -> dict:
     return chat
 
 
+def new_items(items: list[dict]) -> list[dict]:
+    """The items after the last one the hub made: what the client added since its previous turn."""
+    made = [index for index, item in enumerate(items) if item.get("type") in HUB_ITEMS or item.get("role") == "assistant"]
+    return items[made[-1] + 1:] if made else items
+
+
 class Render:
     """Turns harness events into Responses events, building the response object as they go."""
 
-    def __init__(self, response: dict, store: FileStore):
-        self.response, self.store, self.sequence = response, store, 0
+    def __init__(self, response: dict, store: FileStore, session=None):
+        self.response, self.store, self.session, self.sequence = response, store, session, 0
         self.open = None  # (item, part, output_index): the reasoning or message item receiving deltas
         self.tool = None  # (item, output_index, event prefix): the running hub call
 
+    def record(self, kind: str, payload: dict):
+        """Writes one line to the chat's session, when the client named one."""
+        if self.session:
+            self.session.log(self.response["id"], kind, payload)
+
+    def end(self, status: str, error: str | None = None):
+        """Records the items the turn left unfinished, then how it ended."""
+        for item in self.response["output"]:
+            if item["status"] == "in_progress":
+                self.record("response_item", item)
+        if self.response["error"]:
+            error = self.response["error"]["message"]
+        self.record("turn_ended", {"status": status, "error": error})
+
     def send(self, kind: str, **fields) -> str:
+        if kind == "response.output_item.done":  # every finished item passes here once
+            self.record("response_item", fields["item"])
         data = json.dumps({"type": kind, "sequence_number": self.sequence, **fields}, ensure_ascii=False)
         self.sequence += 1
         return f"event: {kind}\ndata: {data}\n\n"
@@ -185,6 +208,8 @@ class Render:
 
     def started(self, event: ToolStarted) -> list[str]:
         call, out = event.call, self.close()
+        function = call.tool_call["function"]
+        self.record("tool_call", {"call": call.id, "name": function["name"], "arguments": function["arguments"]})
         action = dict(call.progress)
         if call.kind == "view":  # the model looks at an older image: nothing for the client to draw
             return out
@@ -205,6 +230,9 @@ class Render:
         return [*out, added, *(self.send(f"{prefix}.{stage}", item_id=item["id"], output_index=index) for stage in stages)]
 
     def finished_tool(self, event: ToolFinished) -> list[str]:
+        output = event.output
+        self.record("tool_output", {"call": event.call.id, "output": output.content if output else None,
+                                    "error": event.error, "files": output.images if output else []})
         if not self.tool:
             return []
         (item, index, prefix), self.tool, out = self.tool, None, []
@@ -260,6 +288,7 @@ class Render:
 
 async def _rendered(harness: Harness, turn, render: Render, request_id: str, stream: bool):
     events = harness.events(turn)
+    status = "failed"  # until the turn ends one way or another
     try:
         for text in render.start():
             yield text
@@ -267,23 +296,39 @@ async def _rendered(harness: Harness, turn, render: Render, request_id: str, str
             for text in render.handle(event):
                 yield text
         trace(request_id, "response", response=render.response)
+        status = render.response["status"]
     except (asyncio.CancelledError, GeneratorExit):
+        status = "disconnected"
         if stream:  # the gateway's race helper logs a non-streaming disconnect
             trace(request_id, "disconnect", response=render.response)
         raise
     finally:
+        render.end(status)
         await events.aclose()  # cancels a running tool and closes the LLM response
         await harness.cleanup(turn)  # also covers leaving before the event iterator starts
 
 
-async def respond(harness: Harness, store: FileStore, body: dict, url: str, request_id: str) -> Response:
+async def respond(harness: Harness, store: FileStore, body: dict, url: str, request_id: str, session=None) -> Response:
     chat = chat_request(body, store)
     response = {"id": request_id, "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": body["model"], "output": [], "error": None, "incomplete_details": None,
                 **{key: body.get(key, default) for key, default in ECHOED.items()},
                 "previous_response_id": None, "store": False, "usage": None}
-    turn = await harness.start(chat, url, request_id)
-    chunks = _rendered(harness, turn, Render(response, store), request_id, body.get("stream") is True)
+    render = Render(response, store, session)
+    if session:
+        items = body["input"] if isinstance(body["input"], list) else [{"role": "user", "content": body["input"]}]
+        render.record("turn_started", {"model": body["model"], "instructions": body.get("instructions")})
+        for item in items if session.new else new_items(items):
+            render.record("response_item", item)
+    try:
+        turn = await harness.start(chat, url, request_id)
+    except asyncio.CancelledError:
+        render.end("disconnected")
+        raise
+    except Exception as error:
+        render.end("failed", str(error))
+        raise
+    chunks = _rendered(harness, turn, render, request_id, body.get("stream") is True)
     if body.get("stream") is True:
         return StreamingResponse(chunks, headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
                                  media_type="text/event-stream")

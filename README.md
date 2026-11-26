@@ -169,7 +169,7 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 
 `known_hosts` and relative SSH key paths are resolved from the configuration directory.
 
-The hub creates `agora.db` (SQLite: users, invites and token hashes) in the configuration directory, next to `files/`. It's backed up with the folder.
+The hub creates `agora.db` (SQLite: users, invites and token hashes) in the configuration directory, next to `files/`. It's backed up with the folder. It also creates `sessions/` there: one folder per chat (see "Sessions").
 
 ## 4. Endpoint calls
 
@@ -243,13 +243,13 @@ Every `/openai/v1` route and `GET /agora/v1/me` require `Authorization: Bearer <
 | `GET /agora/v1/me` | token | `200 {"id", "name"}`: the token's user. |
 | `GET /openai/v1/models` | token | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
 | `POST /openai/v1/chat/completions` | token | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
-| `POST /openai/v1/responses` | token | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
+| `POST /openai/v1/responses` | token | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item, or a `metadata.session_id` that isn't a UUID string), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
 | Any other method or path under `/openai/v1/` | token | `404 not_found`, naming the three routes above. `GET /openai/v1/chat/completions` and `GET /openai/v1/responses/<id>` get it too. |
 
 The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the token and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
 
 - Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
-- `files/` (in the config folder) holds the images the Responses harness stores and saved tool calls (`<id>.json`); published found images also have provenance sidecars (`<id>.metadata.json`). It is never cleaned up and not served over HTTP.
+- `files/` (in the config folder) holds the images the Responses harness stores and saved tool calls (`<id>.json`); published found images also have provenance sidecars (`<id>.metadata.json`). It is never cleaned up and not served over HTTP. Sessions link into it, so keep it, and copy the config folder whole (`cp -a`, `rsync -a`) so the links survive.
 
 ```sh
 TOKEN=your-64-character-token # from /agora/v1/link
@@ -283,7 +283,7 @@ Never open `agora.db` from the host while the hub runs: Docker Desktop's bind mo
 `POST /openai/v1/responses` is for apps: chat, photos the model sees, image generation and editing, and web search.
 
 - **Stateless.** Send the whole conversation each time: your earlier input plus every output item you received. `previous_response_id`, `conversation` and `background: true` answer `400 unsupported_parameter`.
-- **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls` and `max_output_tokens`. Everything else (`store`, `include`, `metadata`, `text`, `reasoning`, `user`, …) is ignored; the response echoes `metadata`, and `store` is always `false` and `usage` `null`.
+- **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls` and `max_output_tokens`. `metadata.session_id` (a UUID) names the chat's session (see "Sessions"). Everything else (`store`, `include`, the rest of `metadata`, `text`, `reasoning`, `user`, …) is ignored; the response echoes `metadata`, and `store` is always `false` and `usage` `null`.
 - **Input items:** `message` (user, system, developer and assistant), `function_call`, `function_call_output`, `image_generation_call` and `web_image_call`. `reasoning` and `web_search_call` items are skipped; any other type answers `400 invalid_request`.
 - **The harness:**
   - every image is labelled `[image_N]`, in order, including the ones the model generated;
@@ -319,6 +319,36 @@ Without `stream`, the body is the final response object, with HTTP 200 whether i
 curl -N -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"model":"agora","stream":true,"input":"draw a red fox"}' http://localhost:8888/openai/v1/responses
 ```
+
+### Sessions
+
+The hub keeps a record of every chat that names itself: a Responses request with `metadata.session_id` (a UUID, any case) is recorded in that chat's session. Without one, the turn runs as before and nothing is recorded; a `session_id` that isn't a UUID string answers `400 invalid_request`. Refused requests (401, 400, 404, 503) write nothing, and `/openai/v1/chat/completions` is never recorded. The user comes from the token: a user's devices share a session, and two users never do.
+
+```
+<config folder>/sessions/<user id>/<session id, lower case>/
+  session.json         {"id", "user_id", "created_at", "updated_at"}
+  conversation.jsonl   one JSON line per event
+  files/               only once the chat has an image: relative links into the shared files/
+```
+
+- **`session.json`:** `created_at` is the time of the first line and never changes; `updated_at` is the time of the last line. Times are UTC with milliseconds, as in the logs. The file is rewritten atomically after every line.
+- **`conversation.jsonl`:** `{"timestamp", "request", "type", "payload"}`, appended and never rewritten. `request` is the response id, as in the logs, so a turn's lines group by it.
+
+| `type` | `payload` |
+| --- | --- |
+| `turn_started` | `model` (after `agora` is resolved) and `instructions` (`null` when there are none) |
+| `response_item` | a Responses item, verbatim, except that a bare `{"role", "content"}` gets `"type": "message"` and images are swapped for links (below) |
+| `tool_call` | `call` (the hub's 32-hex call id, also the stem of `ig_`/`wi_` ids and generated files), `name`, `arguments` (the model's JSON string) |
+| `tool_output` | `call`, `output` (the full text the model read, `null` on an error), `error`, `files` (the file names it made or looked at) |
+| `turn_ended` | `status`, `error` |
+
+- **New input items.** The first time the hub writes to a session, every input item is new (so a chat older than this feature is recorded whole); after that, only the items after the last one the hub made (`reasoning`, `web_search_call`, `image_generation_call`, `web_image_call`, `function_call` or an `assistant` message). A message resent after a failed turn is recorded again. Each output item is recorded when it's done, and each hub tool, `view_image` included, gets a `tool_call` and a `tool_output`.
+- **Images.** No base64 is written. A photo part becomes `{"type": "input_image", "image_url": null, "file": "<name>"}`, and an image item gets `"result": null, "file": "<name>"` (`null` when the hub has no such image). Each file is a relative symlink, `files/<name> -> ../../../../files/<name>`, so it reads both in the container and on the host.
+- **End statuses:** `completed`, `incomplete` or `failed` (the response's own, with its error message), `failed` also when the first LLM round can't be reached or answers an error, and `disconnected` when the client left first; unfinished output items are recorded first, as they stand, with `status: "in_progress"`.
+
+Read a session with `docker exec agora-hub ls -R /config/sessions`, or on the host with `jq -c '[.timestamp, .type]' ~/.config/agora/agora-hub/sessions/<user id>/<session id>/conversation.jsonl`.
+
+Sessions hold whole chats, and their links reach every photo. Nothing is ever cleaned up. Each session's folder and its `files/` are mode 700, inside the private config folder.
 
 ### Web research through Responses
 
@@ -414,3 +444,4 @@ Planned (not built yet):
 - **Partial images** while generating, once the image server streams them.
 - **Codex** on `/openai/v1/responses`: custom and shell tool types, and encrypted reasoning.
 - **Anthropic Messages** at `/anthropic/v1`, through the same harness.
+- **Sessions for every device.** List and fetch a user's sessions, resume a chat on another device, and keep a turn running after the client leaves.

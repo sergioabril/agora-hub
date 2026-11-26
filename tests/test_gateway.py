@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import sqlite3
+from pathlib import Path
 
 import httpx
 import pytest
@@ -23,6 +24,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 16
 PNG_URL = "data:image/png;base64," + base64.b64encode(PNG).decode()
 JPG = b"\xff\xd8\xff" + b"j" * 16
 JPG_URL = "data:image/jpeg;base64," + base64.b64encode(JPG).decode()
+SESSION = "8B1E6C2A-4F0D-4E7B-9C35-2D6A1F0E9B47"  # as Swift's uuidString writes it
 SEARCH_NAMES = ["web_search", "open_page", "web_look", "view_web_images", "show_web_image"]
 
 
@@ -253,9 +255,9 @@ async def test_routing(gateway):
 
 
 @pytest.mark.parametrize("path, body", [("/openai/v1/chat/completions", {"messages": [{"role": "user", "content": "fox"}]}),
-                                        ("/openai/v1/responses", {"input": "fox", "stream": True})])
+                                        ("/openai/v1/responses", {"input": "fox", "stream": True, "metadata": {"session_id": SESSION}})])
 async def test_disconnect(gateway, path, body):
-    _, adapters, controller, app, requests, replies = gateway
+    config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
 
     finished = []
@@ -276,6 +278,8 @@ async def test_disconnect(gateway, path, body):
     assert not any("/images/" in r.url.path for r in requests)
     await asyncio.sleep(0.6)
     assert not finished
+    if path.endswith("responses"):
+        assert lines(session_folder(config))[-1]["payload"] == {"status": "disconnected", "error": None}
 
 
 async def test_chat_passthrough(gateway):
@@ -532,3 +536,59 @@ async def test_responses_items(gateway, capsys):
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [line["request"] for line in lines if line["event"] == "response"] == [searched["id"], called["id"], cut["id"], failed["id"]]
     assert re.fullmatch(r"resp_[0-9a-f]{32}", searched["id"])
+
+
+def session_folder(config):
+    users = list((config.config_dir / "sessions").iterdir())
+    return users[0] / SESSION.lower()
+
+
+def lines(folder):
+    return [json.loads(line) for line in (folder / "conversation.jsonl").read_text().splitlines()]
+
+
+async def test_sessions(gateway):
+    """A Responses request naming metadata.session_id is recorded in sessions/<user>/<session>/:
+    the new input items, every output item, the hub's tool runs and how the turn ended."""
+    config, adapters, controller, app, _, replies = gateway
+    await serve(adapters, controller)
+    replies += [sse({"reasoning_content": "fox?"}, {"content": "Sure."}, tool_call("generate_image", prompt="a red fox"),
+                    finish="tool_calls", joined=True), sse({"content": "Done."}), sse({"content": "Again."})]
+    asked = {"role": "user", "content": [{"type": "input_text", "text": "draw"}, {"type": "input_image", "image_url": JPG_URL}]}
+    metadata = {"session_id": SESSION}
+    async with client(app) as request:
+        output = (await respond(request, input=[asked], metadata=metadata)).json()["output"]
+        folder = session_folder(config)
+        first = json.loads((folder / "session.json").read_text())
+        items = [{**item, "result": None} if item["type"] == "image_generation_call" else item for item in output]
+        await respond(request, input=[asked, *items, {"role": "user", "content": "again"}], metadata=metadata, stream=True)
+    log = lines(folder)
+    kinds = [(line["type"], line["payload"].get("type")) for line in log]
+    assert kinds == [("turn_started", None), ("response_item", "message"), ("response_item", "reasoning"),
+                     ("response_item", "message"), ("tool_call", None), ("tool_output", None),
+                     ("response_item", "image_generation_call"), ("response_item", "message"), ("turn_ended", None),
+                     ("turn_started", None), ("response_item", "message"), ("response_item", "message"), ("turn_ended", None)]
+    photo, made = log[1]["payload"]["content"][1], log[6]["payload"]
+    assert photo["image_url"] is None and (folder / "files" / photo["file"]).read_bytes() == JPG
+    assert made["result"] is None and (folder / "files" / made["file"]).read_bytes() == PNG
+    assert (folder / "files" / made["file"]).readlink() == Path("../../../../files") / made["file"]
+    assert log[4]["payload"]["name"] == "generate_image" and log[5]["payload"]["files"] == [made["file"]]
+    assert log[5]["payload"]["call"] == log[4]["payload"]["call"] == made["id"].removeprefix("ig_")
+    assert log[10]["payload"] == {"type": "message", "role": "user", "content": "again"}
+    assert [log[8]["payload"], log[12]["payload"]] == [{"status": "completed", "error": None}] * 2
+    assert len({line["request"] for line in log[:9]}) == 1 and log[9]["request"] != log[0]["request"]
+    header = json.loads((folder / "session.json").read_text())
+    assert header == {"id": SESSION.lower(), "user_id": folder.parent.name, "created_at": first["created_at"],
+                      "updated_at": log[-1]["timestamp"]}
+    assert first["updated_at"] == log[8]["timestamp"]
+
+
+async def test_sessions_optional(gateway):
+    """Without metadata.session_id nothing is recorded; a session_id that isn't a UUID string is refused."""
+    config, adapters, controller, app, _, _ = gateway
+    await serve(adapters, controller)
+    async with client(app) as request:
+        plain = await respond(request, input="hi", metadata={"tag": "x"})
+        bad = [await respond(request, input="hi", metadata={"session_id": value}) for value in ("nope", 7, "../x")]
+    assert plain.status_code == 200 and not (config.config_dir / "sessions").exists()
+    assert [(r.status_code, r.json()["error"]["code"]) for r in bad] == [(400, "invalid_request")] * 3

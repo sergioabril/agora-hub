@@ -19,8 +19,12 @@ def _short(value, key=None):
     return value
 
 
+def timestamp() -> str:
+    """Now in UTC, to the millisecond: 2026-11-26T11:41:05.123Z."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def trace(request_id: str | None, event: str, **fields):
     """Prints one JSON line to stdout: the conversation log."""
-    time = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    line = {"time": time, "request": request_id, "event": event, **_short(fields)}
+    line = {"time": timestamp(), "request": request_id, "event": event, **_short(fields)}
     print(json.dumps(line, ensure_ascii=False), flush=True)

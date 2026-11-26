@@ -1,6 +1,7 @@
 import asyncio
 import json
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -13,6 +14,7 @@ from .config import Config
 from .controller import Controller
 from .harness import Harness, Message, UpstreamDown, UpstreamError, error_text
 from .responses import BadRequest, respond
+from .sessions import Session
 from .tools import FileStore, Tools
 from .trace import trace
 
@@ -54,6 +56,7 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
     files = FileStore(config.config_dir / "files")
     tools = Tools(client, files, image_target, config.hub.timeouts.image_seconds, config.hub.tools)
     harness = Harness(client, tools, files)
+    sessions = config.config_dir / "sessions"
 
     async def close():
         try:
@@ -180,15 +183,29 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
         url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
         return await race(request, forward({**body, "model": model}, url, deployment.name, request_id), deployment.name)
 
+    def session(body: dict, user: dict) -> Session | None:
+        """The chat a Responses request belongs to, named by metadata.session_id; without one nothing is recorded."""
+        metadata = body.get("metadata")
+        if not isinstance(metadata, dict) or "session_id" not in metadata:
+            return None
+        value = metadata["session_id"]
+        if isinstance(value, str):
+            try:
+                return Session(sessions, user["id"], str(uuid.UUID(value)), files)
+            except ValueError:
+                pass
+        raise GatewayError(400, "invalid_request", "metadata.session_id must be a UUID string")
+
     @router.post("/openai/v1/responses")
-    async def responses(request: Request):
+    async def responses(request: Request, user: Annotated[dict, Depends(authenticate)]):
         body = await parse(request)
         request_id = request.state.trace = f"resp_{secrets.token_hex(16)}"
         trace(request_id, "request", endpoint="responses", body=body)
+        chat_session = session(body, user)
         deployment_id, model = resolve(body["model"])
         deployment = config.deployments[deployment_id]
         url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
-        work = respond(harness, files, {**body, "model": model}, url, request_id)
+        work = respond(harness, files, {**body, "model": model}, url, request_id, chat_session)
         return await race(request, work, deployment.name)
 
     @router.api_route("/openai/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
