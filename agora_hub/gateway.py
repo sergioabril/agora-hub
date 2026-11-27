@@ -7,14 +7,14 @@ from typing import Annotated
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from .accounts import Accounts
 from .config import Config
 from .controller import Controller
-from .harness import Harness, Message, UpstreamDown, UpstreamError, error_text
-from .responses import BadRequest, respond
-from .sessions import Session
+from .harness import Harness, UpstreamDown, UpstreamError, error_text
+from .responses import STREAM_HEADERS, BadRequest, Job, reply, start
+from .sessions import Session, owner
 from .tools import FileStore, Tools
 from .trace import trace
 
@@ -57,8 +57,13 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
     tools = Tools(client, files, image_target, config.hub.timeouts.image_seconds, config.hub.tools)
     harness = Harness(client, tools, files)
     sessions = config.config_dir / "sessions"
+    jobs: dict[str, Job] = {}  # the running Responses turns, by response id
 
     async def close():
+        stopping = list(jobs.values())  # a job leaves jobs once its task ends
+        for job in stopping:
+            job.cancel("interrupted")  # recorded as such, before the client and tools it uses close
+        await asyncio.gather(*(job.task for job in stopping), return_exceptions=True)
         try:
             await tools.close()
         finally:
@@ -122,95 +127,163 @@ def create_gateway(config: Config, controller: Controller, accounts: Accounts, t
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-            trace(request.state.trace, "disconnect")
             return Response(status_code=499)  # never delivered: the client has gone
         gone.cancel()
         try:
             return task.result()
-        except BadRequest as error:
-            raise GatewayError(400, error.code, error.message)
         except UpstreamDown as error:
             raise GatewayError(502, "upstream_unavailable", f"{name}: {error}")
         except UpstreamError as error:
             raise GatewayError(error.status, "upstream_error", f"{name}: {error.message}")
 
-    async def relay(upstream: httpx.Response, request_id: str):
-        message = Message()
+    async def relay(upstream: httpx.Response):
         try:
             async for line in upstream.aiter_lines():
-                if line.startswith("data:") and (data := line[5:].strip()) != "[DONE]":
-                    try:
-                        message.add(json.loads(data))
-                    except ValueError:
-                        pass
                 yield line + "\n"
-            trace(request_id, "upstream.response", status=upstream.status_code, message=message.summary())
-        except httpx.HTTPError as error:
-            trace(request_id, "upstream.error", error=error_text(error))
-        except (asyncio.CancelledError, GeneratorExit):
-            trace(request_id, "disconnect", message=message.summary())
-            raise
+        except httpx.HTTPError:
+            pass  # the LLM's stream broke: the client's stream ends there
         finally:
             await upstream.aclose()
 
-    async def forward(body: dict, url: str, name: str, request_id: str) -> Response:
-        trace(request_id, "upstream.request", url=url, body=body)
+    async def forward(body: dict, url: str, name: str) -> Response:
         try:
             upstream = await client.send(client.build_request("POST", url, json=body), stream=True)
             content_type = upstream.headers.get("content-type", "")
             if not content_type.startswith("text/event-stream"):
                 await upstream.aread()
         except httpx.RequestError as error:
-            trace(request_id, "upstream.error", error=error_text(error))
             raise GatewayError(502, "upstream_unavailable", f"{name}: {error_text(error)}")
         if content_type.startswith("text/event-stream"):
-            headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-            return StreamingResponse(relay(upstream, request_id), upstream.status_code, headers, content_type)
-        try:
-            logged = upstream.json()
-        except ValueError:
-            logged = upstream.text
-        trace(request_id, "upstream.response", status=upstream.status_code, body=logged)
+            return StreamingResponse(relay(upstream), upstream.status_code, STREAM_HEADERS, content_type)
         return Response(upstream.content, upstream.status_code, media_type=content_type or None)
 
     @router.post("/openai/v1/chat/completions")
-    async def chat(request: Request):
+    async def chat(request: Request, user: Annotated[dict, Depends(authenticate)]):
         body = await parse(request)
         request_id = request.state.trace = f"chat_{secrets.token_hex(8)}"
-        trace(request_id, "request", endpoint="chat/completions", body=body)
+        trace(request_id, "request", endpoint="chat/completions", user=user["id"])
         deployment_id, model = resolve(body["model"])
         deployment = config.deployments[deployment_id]
         url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
-        return await race(request, forward({**body, "model": model}, url, deployment.name, request_id), deployment.name)
+        return await race(request, forward({**body, "model": model}, url, deployment.name), deployment.name)
 
-    def session(body: dict, user: dict) -> Session | None:
-        """The chat a Responses request belongs to, named by metadata.session_id; without one nothing is recorded."""
-        metadata = body.get("metadata")
-        if not isinstance(metadata, dict) or "session_id" not in metadata:
-            return None
-        value = metadata["session_id"]
+    def uuid_string(value) -> str | None:
+        """The lower-case form of a UUID string (Swift writes upper case), safe as a folder name; None if it isn't one."""
         if isinstance(value, str):
             try:
-                return Session(sessions, user["id"], str(uuid.UUID(value)), files)
+                return str(uuid.UUID(value))
             except ValueError:
                 pass
-        raise GatewayError(400, "invalid_request", "metadata.session_id must be a UUID string")
+        return None
+
+    def running(folder) -> str | None:
+        """The id of the turn running in the session at folder, if any."""
+        for request_id, job in jobs.items():
+            if job.session and job.session.folder == folder:
+                return request_id
+        return None
+
+    def mine(session_id: str, user: dict) -> Session:
+        """The token user's session with this id; another user's answers 403."""
+        if owner(sessions, session_id) not in (None, user["id"]):
+            raise GatewayError(403, "forbidden", "this conversation belongs to another user")
+        return Session(sessions, user["id"], session_id, files)
+
+    def conversation(body: dict, user: dict) -> Session | None:
+        """The chat a Responses request continues, named by conversation; without one, nothing is recorded."""
+        value = body.get("conversation")
+        if value is None:
+            return None
+        if isinstance(value, dict):  # OpenAI also allows {"id": …}
+            value = value.get("id")
+        session_id = uuid_string(value)
+        if not session_id:
+            raise GatewayError(400, "invalid_request", "conversation must be a UUID string")
+        session = mine(session_id, user)
+        if running(session.folder):
+            raise GatewayError(409, "conversation_busy", "a turn of this conversation is still running")
+        return session
+
+    def recorded(value: str, user: dict) -> Session:
+        """The token user's recorded session with this id, for the read routes."""
+        missing = GatewayError(404, "not_found", f"no session {value}")
+        session_id = uuid_string(value)
+        if not session_id:
+            raise missing
+        session = mine(session_id, user)
+        if not session.folder.is_dir():
+            raise missing
+        return session
+
+    def job_of(response_id: str, user: dict) -> Job:
+        """A running turn of the token user's. The hub keeps finished turns only in sessions."""
+        job = jobs.get(response_id)
+        if not job:
+            raise GatewayError(404, "not_found", f"response {response_id} is not running; read its session instead")
+        if job.user_id != user["id"]:
+            raise GatewayError(403, "forbidden", "this response belongs to another user")
+        return job
 
     @router.post("/openai/v1/responses")
     async def responses(request: Request, user: Annotated[dict, Depends(authenticate)]):
         body = await parse(request)
         request_id = request.state.trace = f"resp_{secrets.token_hex(16)}"
-        trace(request_id, "request", endpoint="responses", body=body)
-        chat_session = session(body, user)
+        trace(request_id, "request", endpoint="responses", user=user["id"])
+        session = conversation(body, user)
+        if body.get("background") is True and not session:
+            raise GatewayError(400, "invalid_request", "background needs a conversation: the hub keeps the turn there")
         deployment_id, model = resolve(body["model"])
         deployment = config.deployments[deployment_id]
         url = str(deployment.endpoint).rstrip("/") + "/chat/completions"
-        work = respond(harness, files, {**body, "model": model}, url, request_id, chat_session)
-        return await race(request, work, deployment.name)
+        try:
+            job = start(harness, files, {**body, "model": model}, url, request_id, user["id"], session)
+        except BadRequest as error:
+            raise GatewayError(400, error.code, error.message)
+        jobs[request_id] = job  # before any await, so a second turn of the same session gets 409
+        job.task.add_done_callback(lambda _: jobs.pop(request_id))
+        return await race(request, reply(job, body.get("stream") is True), deployment.name)
+
+    @router.get("/openai/v1/responses/{response_id}")
+    async def watch(response_id: str, user: Annotated[dict, Depends(authenticate)], stream: bool = False,
+                    starting_after: int = -1):
+        job = job_of(response_id, user)
+        if stream:
+            return StreamingResponse(job.watch(starting_after), headers=STREAM_HEADERS, media_type="text/event-stream")
+        return job.response
+
+    @router.post("/openai/v1/responses/{response_id}/cancel")
+    async def cancel(response_id: str, user: Annotated[dict, Depends(authenticate)]):
+        job = job_of(response_id, user)
+        job.cancel("cancelled")
+        await asyncio.wait({job.task})  # so the session holds how the turn ended before the answer goes
+        return job.response
+
+    @router.get("/agora/v1/sessions")
+    async def list_sessions(user: Annotated[dict, Depends(authenticate)]):
+        found = []
+        for header in (sessions / user["id"]).glob("*/session.json"):
+            found.append({**json.loads(header.read_text()), "running": running(header.parent)})
+        return {"data": sorted(found, key=lambda chat: chat["updated_at"], reverse=True)}
+
+    @router.get("/agora/v1/sessions/{session_id}")
+    async def read_session(session_id: str, user: Annotated[dict, Depends(authenticate)]):
+        session = recorded(session_id, user)
+        running_id = running(session.folder)
+        header = json.loads((session.folder / "session.json").read_text())
+        return {**header, "running": running_id, "turns": session.turns(running_id)}
+
+    @router.get("/agora/v1/sessions/{session_id}/files/{name}")
+    async def session_file(session_id: str, name: str, user: Annotated[dict, Depends(authenticate)]):
+        session = recorded(session_id, user)
+        path = files.path(name)
+        if not path or not (session.files / name).is_symlink():
+            raise GatewayError(404, "not_found", f"{name} is not a file of this session")
+        return FileResponse(path)
 
     @router.api_route("/openai/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
     async def not_served(path: str, request: Request):
-        served = "GET /openai/v1/models, POST /openai/v1/chat/completions and POST /openai/v1/responses"
+        served = ("GET /openai/v1/models, POST /openai/v1/chat/completions, POST /openai/v1/responses, "
+                  "GET /openai/v1/responses/{id} and POST /openai/v1/responses/{id}/cancel")
         raise GatewayError(404, "not_found", f"{request.method} /openai/v1/{path} is not served; the gateway serves {served}")
 
     app.include_router(router)

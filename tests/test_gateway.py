@@ -255,7 +255,7 @@ async def test_routing(gateway):
 
 
 @pytest.mark.parametrize("path, body", [("/openai/v1/chat/completions", {"messages": [{"role": "user", "content": "fox"}]}),
-                                        ("/openai/v1/responses", {"input": "fox", "stream": True, "metadata": {"session_id": SESSION}})])
+                                        ("/openai/v1/responses", {"input": "fox", "stream": True, "conversation": SESSION})])
 async def test_disconnect(gateway, path, body):
     config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
@@ -302,22 +302,25 @@ async def test_chat_passthrough(gateway):
 
 
 async def test_trace(gateway, capsys):
+    """The stdout log says who called and which tools ran. What was said lives only in sessions."""
     _, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
-    replies.append(sse({"role": "assistant", "content": "A"}, {"content": " fox."}))
-    messages = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": PNG_URL}}]}]
+    replies += [sse({"content": "A fox."}), sse(tool_call("generate_image", prompt="a fox"), finish="tool_calls"),
+                sse({"content": "Done."})]
     async with client(app) as request:
-        await ask(request, messages, stream=True)
-        await ask(request, messages, model="nope")
-    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    first = lines[0]["request"]
-    assert re.fullmatch(r"chat_[0-9a-f]{16}", first)
-    assert [(line["event"], line["request"] == first) for line in lines[:3]] == [
-        ("request", True), ("upstream.request", True), ("upstream.response", True)]
-    url = lines[0]["body"]["messages"][0]["content"][0]["image_url"]["url"]
-    assert url == f"data:image/png;base64,<{len(PNG_URL)} chars>"
-    assert lines[2]["message"]["content"] == "A fox." and lines[2]["message"]["finish_reason"] == "stop"
-    assert lines[-1]["event"] == "error" and lines[-1]["code"] == "model_not_found" and lines[-1]["request"] != first
+        me = (await request.get("/agora/v1/me", headers=KEY)).json()["id"]
+        await ask(request, [{"role": "user", "content": "a secret fox"}], stream=True)
+        drawn = (await respond(request, input="draw a fox")).json()
+        await ask(request, [], model="nope")
+    out = capsys.readouterr().out
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert [(line["event"], line.get("endpoint"), line.get("user")) for line in lines] == [
+        ("request", "chat/completions", me), ("request", "responses", me), ("tool", None, None),
+        ("request", "chat/completions", me), ("error", None, None)]
+    assert re.fullmatch(r"chat_[0-9a-f]{16}", lines[0]["request"]) and lines[1]["request"] == lines[2]["request"] == drawn["id"]
+    assert set(lines[2]) == {"time", "request", "event", "call", "name", "seconds", "error"}
+    assert lines[2]["name"] == "generate_image" and lines[2]["error"] is None
+    assert lines[-1]["code"] == "model_not_found" and "fox" not in out
 
 
 def tool_call(name, **arguments):
@@ -403,8 +406,7 @@ async def test_harness_tools_and_errors(harness, capsys, monkeypatch):
     replies.append(sse({"content": "ok"}))
     await turn(harness, user)
     assert [tool["function"]["name"] for tool in chats(requests)[-1]["tools"]] == ["view_image", *SEARCH_NAMES]
-    events = [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()]
-    assert events.count("tool.call") == events.count("tool.result") == 2
+    assert [json.loads(line)["event"] for line in capsys.readouterr().out.splitlines()] == ["tool"] * 2
 
 
 def respond(request, **body):
@@ -516,7 +518,7 @@ async def test_responses_view(gateway):
     assert [item["type"] for item in output] == ["image_generation_call", "message"]
 
 
-async def test_responses_items(gateway, capsys):
+async def test_responses_items(gateway):
     _, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
     lookup = {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
@@ -533,8 +535,6 @@ async def test_responses_items(gateway, capsys):
                                                                                 '{"q": "x"}')
     assert cut["status"] == "incomplete" and cut["incomplete_details"] == {"reason": "max_output_tokens"}
     assert failed["status"] == "failed" and failed["error"] == {"code": "server_error", "message": "upstream returned HTTP 500"}
-    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert [line["request"] for line in lines if line["event"] == "response"] == [searched["id"], called["id"], cut["id"], failed["id"]]
     assert re.fullmatch(r"resp_[0-9a-f]{32}", searched["id"])
 
 
@@ -547,48 +547,138 @@ def lines(folder):
     return [json.loads(line) for line in (folder / "conversation.jsonl").read_text().splitlines()]
 
 
-async def test_sessions(gateway):
-    """A Responses request naming metadata.session_id is recorded in sessions/<user>/<session>/:
-    the new input items, every output item, the hub's tool runs and how the turn ended."""
-    config, adapters, controller, app, _, replies = gateway
+def trickle(*words):
+    """A streamed reply that takes its time, a word every 50 ms, like a real LLM."""
+    async def body():
+        for word in words:
+            yield f"data: {json.dumps({'choices': [{'index': 0, 'delta': {'content': word}}]})}\n\n".encode()
+            await asyncio.sleep(0.05)
+        yield b'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n'
+    return httpx.Response(200, content=body(), headers={"content-type": "text/event-stream"})
+
+
+async def hang_up(app, body: dict, after: int) -> str:
+    """Streams a Responses request over raw ASGI and hangs up after `after` events, as a phone leaving a chat does."""
+    received, got = asyncio.Queue(), []
+    received.put_nowait({"type": "http.request", "body": json.dumps({"model": "agora", **body}).encode()})
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("body"):
+            got.append(message["body"].decode())
+            if len(got) == after:
+                received.put_nowait({"type": "http.disconnect"})
+    scope = {"type": "http", "method": "POST", "path": "/openai/v1/responses", "query_string": b"",
+             "headers": [(b"authorization", KEY["Authorization"].encode())]}
+    await app(scope, received.get, send)
+    return "".join(got)
+
+
+async def running(request) -> str:
+    """Waits until a turn runs in SESSION, and returns its id."""
+    while True:
+        found = (await request.get("/agora/v1/sessions", headers=KEY)).json()["data"]
+        if found and found[0]["running"]:
+            return found[0]["running"]
+        await asyncio.sleep(0.01)
+
+
+async def test_conversation(gateway):
+    """A chat named by conversation is recorded turn by turn in sessions/<user>/<id>/. A later turn sends only its new
+    message: the hub puts the recorded chat before it, photo and drawn image included. The read routes give it back."""
+    config, adapters, controller, app, requests, replies = gateway
     await serve(adapters, controller)
     replies += [sse({"reasoning_content": "fox?"}, {"content": "Sure."}, tool_call("generate_image", prompt="a red fox"),
                     finish="tool_calls", joined=True), sse({"content": "Done."}), sse({"content": "Again."})]
     asked = {"role": "user", "content": [{"type": "input_text", "text": "draw"}, {"type": "input_image", "image_url": JPG_URL}]}
-    metadata = {"session_id": SESSION}
     async with client(app) as request:
-        output = (await respond(request, input=[asked], metadata=metadata)).json()["output"]
+        first = (await respond(request, input=[asked], conversation=SESSION)).json()
+        await respond(request, input="again", conversation={"id": SESSION}, stream=True)
         folder = session_folder(config)
-        first = json.loads((folder / "session.json").read_text())
-        items = [{**item, "result": None} if item["type"] == "image_generation_call" else item for item in output]
-        await respond(request, input=[asked, *items, {"role": "user", "content": "again"}], metadata=metadata, stream=True)
+        with open(folder / "conversation.jsonl", "a") as file:  # a turn the hub never ended: it stopped mid-turn
+            file.write(json.dumps({"timestamp": "2026-11-26T12:00:00.000Z", "request": "resp_cut", "type": "turn_started",
+                                  "payload": {"model": "m1", "instructions": None, "input": []}}) + "\n")
+        listed = (await request.get("/agora/v1/sessions", headers=KEY)).json()["data"]
+        chat = (await request.get(f"/agora/v1/sessions/{SESSION}", headers=KEY)).json()
+        made = chat["turns"][0]["output"][2]
+        image = await request.get(f"/agora/v1/sessions/{SESSION}/files/{made['file']}", headers=KEY)
+        missing = await request.get(f"/agora/v1/sessions/{SESSION}/files/{'0' * 32}.png", headers=KEY)
     log = lines(folder)
-    kinds = [(line["type"], line["payload"].get("type")) for line in log]
-    assert kinds == [("turn_started", None), ("response_item", "message"), ("response_item", "reasoning"),
-                     ("response_item", "message"), ("tool_call", None), ("tool_output", None),
-                     ("response_item", "image_generation_call"), ("response_item", "message"), ("turn_ended", None),
-                     ("turn_started", None), ("response_item", "message"), ("response_item", "message"), ("turn_ended", None)]
-    photo, made = log[1]["payload"]["content"][1], log[6]["payload"]
+    assert [(line["type"], line["payload"].get("type")) for line in log] == [
+        ("turn_started", None), ("response_item", "reasoning"), ("response_item", "message"), ("tool_call", None),
+        ("tool_output", None), ("response_item", "image_generation_call"), ("response_item", "message"),
+        ("turn_ended", None), ("turn_started", None), ("response_item", "message"), ("turn_ended", None),
+        ("turn_started", None)]
+    photo = log[0]["payload"]["input"][0]["content"][1]
     assert photo["image_url"] is None and (folder / "files" / photo["file"]).read_bytes() == JPG
-    assert made["result"] is None and (folder / "files" / made["file"]).read_bytes() == PNG
-    assert (folder / "files" / made["file"]).readlink() == Path("../../../../files") / made["file"]
-    assert log[4]["payload"]["name"] == "generate_image" and log[5]["payload"]["files"] == [made["file"]]
-    assert log[5]["payload"]["call"] == log[4]["payload"]["call"] == made["id"].removeprefix("ig_")
-    assert log[10]["payload"] == {"type": "message", "role": "user", "content": "again"}
-    assert [log[8]["payload"], log[12]["payload"]] == [{"status": "completed", "error": None}] * 2
-    assert len({line["request"] for line in log[:9]}) == 1 and log[9]["request"] != log[0]["request"]
-    header = json.loads((folder / "session.json").read_text())
-    assert header == {"id": SESSION.lower(), "user_id": folder.parent.name, "created_at": first["created_at"],
-                      "updated_at": log[-1]["timestamp"]}
-    assert first["updated_at"] == log[8]["timestamp"]
+    assert log[8]["payload"]["input"] == [{"type": "message", "role": "user", "content": "again"}]
+    live, later = chats(requests)[1]["messages"], chats(requests)[2]["messages"]
+    assert later == [*live, {"role": "assistant", "content": "Done."}, {"role": "user", "content": "again"}]
+    assert listed == [{**json.loads((folder / "session.json").read_text()), "running": None}]
+    assert [(turn["id"], turn["status"], len(turn["input"]), len(turn["output"])) for turn in chat["turns"]] == [
+        (first["id"], "completed", 1, 4), (log[8]["request"], "completed", 1, 1), ("resp_cut", "interrupted", 0, 0)]
+    assert made["result"] is None and (folder / "files" / made["file"]).readlink() == Path("../../../../files") / made["file"]
+    assert image.content == PNG and image.headers["content-type"] == "image/png" and missing.status_code == 404
 
 
-async def test_sessions_optional(gateway):
-    """Without metadata.session_id nothing is recorded; a session_id that isn't a UUID string is refused."""
-    config, adapters, controller, app, _, _ = gateway
+async def test_conversation_rules(gateway):
+    """No conversation records nothing. A bad id, or background without a conversation, gets 400. Another user's chat
+    or turn gets 403, a second turn while one runs 409, and a turn that has ended, or an unknown chat, 404."""
+    config, adapters, controller, app, _, replies = gateway
     await serve(adapters, controller)
+    accounts = Accounts(config.config_dir / "agora.db")
+    other = {"Authorization": "Bearer " + accounts.link(accounts.add("Other")["invite_code"], "Other phone")["token"]}
+    replies += [sse({"content": "hi"}), trickle("a ", "b ", "c ")]
+    chat = f"/agora/v1/sessions/{SESSION}"
     async with client(app) as request:
-        plain = await respond(request, input="hi", metadata={"tag": "x"})
-        bad = [await respond(request, input="hi", metadata={"session_id": value}) for value in ("nope", 7, "../x")]
-    assert plain.status_code == 200 and not (config.config_dir / "sessions").exists()
-    assert [(r.status_code, r.json()["error"]["code"]) for r in bad] == [(400, "invalid_request")] * 3
+        plain = await respond(request, input="hi")
+        bad = [await respond(request, input="hi", **extra) for extra in (
+            {"conversation": "nope"}, {"conversation": 7}, {"conversation": "../x"}, {"background": True})]
+        nothing = not (config.config_dir / "sessions").exists()
+        turn = asyncio.create_task(respond(request, input="slow", conversation=SESSION, background=True, stream=True))
+        response = f"/openai/v1/responses/{await running(request)}"
+        busy = await respond(request, input="again", conversation=SESSION)
+        theirs = [await request.post("/openai/v1/responses", json={"model": "agora", "input": "hi", "conversation": SESSION},
+                                     headers=other),
+                  await request.get(chat, headers=other), await request.get(f"{chat}/files/{'0' * 32}.png", headers=other),
+                  await request.get(response, headers=other), await request.post(f"{response}/cancel", headers=other)]
+        their_list = (await request.get("/agora/v1/sessions", headers=other)).json()
+        await turn
+        gone = [await request.get(response, headers=KEY), await request.post(f"{response}/cancel", headers=KEY),
+                await request.get("/agora/v1/sessions/00000000-0000-4000-8000-000000000000", headers=KEY),
+                await request.get("/agora/v1/sessions/nope", headers=KEY)]
+    assert plain.status_code == 200 and nothing
+    assert [(r.status_code, r.json()["error"]["code"]) for r in bad] == [(400, "invalid_request")] * 4
+    assert (busy.status_code, busy.json()["error"]["code"]) == (409, "conversation_busy")
+    assert [(r.status_code, r.json()["error"]["code"]) for r in theirs] == [(403, "forbidden")] * 5
+    assert their_list == {"data": []}
+    assert [(r.status_code, r.json()["error"]["code"]) for r in gone] == [(404, "not_found")] * 4
+
+
+async def test_background(gateway):
+    """A background turn outlives its client: it runs to the end, and another connection can rejoin it from the start
+    or after an event. Cancel stops it and records the reply as it stood."""
+    config, adapters, controller, app, _, replies = gateway
+    await serve(adapters, controller)
+    replies += [trickle(*[f"word{n} " for n in range(8)]), trickle(*[f"word{n} " for n in range(40)])]
+    body = {"input": "slow", "conversation": SESSION, "background": True, "stream": True}
+    got = sse_events(await hang_up(app, body, after=5))
+    response = f"/openai/v1/responses/{got[0]['response']['id']}"
+    async with client(app) as request:
+        whole, rest = await asyncio.gather(request.get(f"{response}?stream=true", headers=KEY),
+                                           request.get(f"{response}?stream=true&starting_after=3", headers=KEY))
+        ended = await request.get(response, headers=KEY)
+        turn = asyncio.create_task(respond(request, **body))
+        second = f"/openai/v1/responses/{await running(request)}"
+        while not (await request.get(second, headers=KEY)).json()["output"]:
+            await asyncio.sleep(0.01)
+        cancelled = (await request.post(f"{second}/cancel", headers=KEY)).json()
+        await turn
+    events = sse_events(whole.text)
+    assert events[:len(got)] == got and events[-1]["type"] == "response.completed"
+    assert [e["sequence_number"] for e in events] == list(range(len(events))) and sse_events(rest.text) == events[4:]
+    assert ended.status_code == 404
+    log = lines(session_folder(config))
+    first_end = next(line for line in log if line["type"] == "turn_ended")
+    assert first_end["payload"] == {"status": "completed", "error": None}
+    assert log[-2]["payload"]["status"] == "in_progress" and log[-2]["payload"]["content"][0]["text"].startswith("word0 ")
+    assert cancelled["status"] == "cancelled" and log[-1]["payload"] == {"status": "cancelled", "error": None}

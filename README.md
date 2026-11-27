@@ -57,7 +57,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"host":"192.168.1.10","por
 
 SSH host keys are trusted on first use, like `ssh -o StrictHostKeyChecking=accept-new`: the first time the hub connects to a host that isn't in `known_hosts`, it saves that host's key there. From then on, the host must keep presenting a saved key, or the hub refuses to connect and reports a `host_key` error, so a machine impersonating it can't collect the SSH or sudo password. After a legitimate key change (a reinstall), remove the old entry with `ssh-keygen -R <host> -f ~/.config/agora/agora-hub/known_hosts`; the next connection saves the new key. `known_hosts` is read on every SSH connection, so no restart is needed.
 
-Logs: `docker logs -f agora-hub` (the gateway's conversation log is described in §4). Undeploy: `docker rm -f agora-hub`.
+Logs: `docker logs -f agora-hub` (the gateway's log is described in §4). Undeploy: `docker rm -f agora-hub`.
 
 ## 3. Config files
 
@@ -169,7 +169,7 @@ chmod 600 "$CONFIG_DIR"/{hub.yaml,machines.yaml,deployments.yaml,known_hosts}
 
 `known_hosts` and relative SSH key paths are resolved from the configuration directory.
 
-The hub creates `agora.db` (SQLite: users, invites and token hashes) in the configuration directory, next to `files/`. It's backed up with the folder. It also creates `sessions/` there: one folder per chat (see "Sessions").
+The hub creates `agora.db` (SQLite: users, invites and token hashes) in the configuration directory, next to `files/`. It's backed up with the folder. It also creates `sessions/` there: one folder per chat that names a `conversation` (see "Sessions").
 
 ## 4. Endpoint calls
 
@@ -233,7 +233,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applicati
 
 The gateway speaks the OpenAI API. Clients use the base URL `http://<public host>:8888/openai/v1`; the prefix names the API format.
 
-Every `/openai/v1` route and `GET /agora/v1/me` require `Authorization: Bearer <token>`, a user token from `/agora/v1/link` (see "Accounts" below). A missing, unknown or revoked token, or a disabled user's token, gets `401 invalid_api_key`. There's no cache: a revoke, disable or enable applies from the next request. The admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
+Every `/openai/v1` route, `GET /agora/v1/me` and the `/agora/v1/sessions…` routes require `Authorization: Bearer <token>`, a user token from `/agora/v1/link` (see "Accounts" below). A missing, unknown or revoked token, or a disabled user's token, gets `401 invalid_api_key`. There's no cache: a revoke, disable or enable applies from the next request. The admin token is never valid here, and the admin routes don't exist on this port. Errors use OpenAI's shape, `{"error": {"message", "type", "code"}}`.
 
 `model: "agora"` goes to the first running LLM deployment (in `deployments.yaml` order) and its first served model id. It's the model-agnostic choice for small tools that don't care which model answers. Any other `model` must exactly match a model id a running LLM deployment serves. Otherwise the request fails with `404 model_not_found`, or `503` while no LLM is running.
 
@@ -243,13 +243,18 @@ Every `/openai/v1` route and `GET /agora/v1/me` require `Authorization: Bearer <
 | `GET /agora/v1/me` | token | `200 {"id", "name"}`: the token's user. |
 | `GET /openai/v1/models` | token | `{"object": "list", "data": [...]}`: `agora` first (while an LLM runs), then every model id a running LLM deployment serves (`owned_by` is its deployment id). Image models aren't listed. `[]` while no LLM runs. |
 | `POST /openai/v1/chat/completions` | token | A plain pass-through to the LLM (below). The hub's own errors: `400 invalid_request` (the body isn't a JSON object, or `model` is missing or not a string), `404 model_not_found` (the message lists the ids `/models` lists; image model ids get it too), `502 upstream_unavailable` (the LLM couldn't be reached), `503 no_llm_running` (with `Retry-After: 30` while an LLM is starting). The LLM's own errors reach the client unchanged. |
-| `POST /openai/v1/responses` | token | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item, or a `metadata.session_id` that isn't a UUID string), `400 unsupported_parameter` (`previous_response_id`, `conversation`, `background`), `400 unsupported_tool`, `404 model_not_found`, `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
-| Any other method or path under `/openai/v1/` | token | `404 not_found`, naming the three routes above. `GET /openai/v1/chat/completions` and `GET /openai/v1/responses/<id>` get it too. |
+| `POST /openai/v1/responses` | token | The OpenAI Responses API, through the hub's harness (below). Errors: `400 invalid_request` (a bad body, `input` or item, a `conversation` that isn't a UUID string, or `background` without a conversation), `400 unsupported_parameter` (`previous_response_id`), `400 unsupported_tool`, `403 forbidden` (another user's conversation), `404 model_not_found`, `409 conversation_busy` (a turn of that conversation is running), `502 upstream_unavailable`, `503 no_llm_running`, and `upstream_error` with the upstream's status when the LLM's first round answers an error. |
+| `GET /openai/v1/responses/{id}` | token | A running turn of yours. With `stream=true`, its events from the start, then live until it ends; with `starting_after=<n>`, after the event whose `sequence_number` is `n`. Without `stream`, the response object as it stands. `403 forbidden` (another user's turn), `404 not_found` (no such turn, or it has ended: read its session). |
+| `POST /openai/v1/responses/{id}/cancel` | token | Stops a running turn of yours. Answers the response object with `status: "cancelled"` once the turn's end is recorded. `403 forbidden` (another user's turn), `404 not_found` (no such turn, or it has ended). |
+| `GET /agora/v1/sessions` | token | `{"data": [...]}`: your chats, newest `updated_at` first (see "Sessions"). Another user's chats are never listed. |
+| `GET /agora/v1/sessions/{id}` | token | One of your chats, turn by turn. `403 forbidden` (another user's chat), `404 not_found` (no such chat, or an id that isn't a UUID). |
+| `GET /agora/v1/sessions/{id}/files/{name}` | token | One of the chat's images, with its media type. `403 forbidden` (another user's chat), `404 not_found` (no such chat, or `name` isn't linked in its `files/`). |
+| Any other method or path under `/openai/v1/` | token | `404 not_found`, naming the five `/openai/v1` routes above. `GET /openai/v1/chat/completions` gets it too. |
 
 The chat route is a plain pass-through: the hub resolves `model` (rule above), checks the token and logs the request. Everything else in the body, the reply (streamed or not) and the LLM's errors go through unchanged, and so do images in messages. The client's headers are never forwarded. A client disconnect stops the generation.
 
 - Public host: `make deploy` detects the address to advertise (Tailscale `100.x`, else LAN, else any), prints it, and the hub reports it to the dashboard. `make deploy PUBLIC_HOST=…` overrides it.
-- `files/` (in the config folder) holds the images the Responses harness stores and saved tool calls (`<id>.json`); published found images also have provenance sidecars (`<id>.metadata.json`). It is never cleaned up and not served over HTTP. Sessions link into it, so keep it, and copy the config folder whole (`cp -a`, `rsync -a`) so the links survive.
+- `files/` (in the config folder) holds the images the Responses harness stores and saved tool calls (`<id>.json`); published found images also have provenance sidecars (`<id>.metadata.json`). It is never cleaned up. Over HTTP, only a chat's own images are served, through `GET /agora/v1/sessions/{id}/files/{name}`. Sessions link into it, so keep it, and copy the config folder whole (`cp -a`, `rsync -a`) so the links survive.
 
 ```sh
 TOKEN=your-64-character-token # from /agora/v1/link
@@ -282,8 +287,8 @@ Never open `agora.db` from the host while the hub runs: Docker Desktop's bind mo
 
 `POST /openai/v1/responses` is for apps: chat, photos the model sees, image generation and editing, and web search.
 
-- **Stateless.** Send the whole conversation each time: your earlier input plus every output item you received. `previous_response_id`, `conversation` and `background: true` answer `400 unsupported_parameter`.
-- **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls` and `max_output_tokens`. `metadata.session_id` (a UUID) names the chat's session (see "Sessions"). Everything else (`store`, `include`, the rest of `metadata`, `text`, `reasoning`, `user`, …) is ignored; the response echoes `metadata`, and `store` is always `false` and `usage` `null`.
+- **Stateless, or a conversation.** Send the whole conversation each time: your earlier input plus every output item you received. Or name it with `conversation` (a UUID) and send only what's new: the hub puts the chat's recorded history before your input (see "Sessions"). `previous_response_id` still answers `400 unsupported_parameter`.
+- **Fields honoured:** `model` (same rule as chat), `input` (a string or a list of items), `instructions`, `tools` (`function` tools; `web_search`, `web_search_preview` and `image_generation` are accepted and ignored, since the hub's tools are on anyway; any other type answers `400 unsupported_tool`), `tool_choice`, `stream`, `temperature`, `top_p`, `parallel_tool_calls`, `max_output_tokens`, `conversation` (a UUID string, or `{"id": "<UUID>"}`) and `background`. `metadata` is only echoed back. Everything else (`store`, `include`, `text`, `reasoning`, `user`, …) is ignored; `store` is always `false` and `usage` `null`.
 - **Input items:** `message` (user, system, developer and assistant), `function_call`, `function_call_output`, `image_generation_call` and `web_image_call`. `reasoning` and `web_search_call` items are skipped; any other type answers `400 invalid_request`.
 - **The harness:**
   - every image is labelled `[image_N]`, in order, including the ones the model generated;
@@ -293,7 +298,11 @@ Never open `agora.db` from the host while the hub runs: Docker Desktop's bind mo
   - image generation, and editing of up to four images, while an image deployment runs. Editing works on any image of the conversation, attached or not: the hub reads the file by its label;
   - the five default-on search-family functions described below;
   - your own `function` tools, which come back as `function_call` items. A client declaration wins a name collision with a hub function, including when its hub family is disabled or exhausted;
-  - the family/global action budgets in §3, a final synthesis iteration, and cleanup when a client disconnects. `tool_choice: "none"` suppresses hub tool offering and execution from the first iteration; unsolicited hub calls then fail explicitly.
+  - the family/global action budgets in §3, a final synthesis iteration, and cleanup when a turn ends or is stopped. `tool_choice: "none"` suppresses hub tool offering and execution from the first iteration; unsolicited hub calls then fail explicitly.
+- **Background:** `background: true` keeps a turn running after the client leaves. It needs a `conversation`, where the finished turn lives; otherwise `400 invalid_request`. With `stream: true` the response streams the turn's events; without, it answers at once with the response as it stands (`status: "in_progress"`). Without `background`, the turn stops when the client that started it leaves, as before. Any running turn of yours, with or without `background`, can be watched and stopped:
+  - `GET /openai/v1/responses/{id}?stream=true` rejoins it: it replays the turn's events from the start (or after `starting_after=<n>`), then follows it live until it ends. A watcher that gets nothing new for 10 seconds sends a keep-alive comment, and leaving never stops a background turn;
+  - `POST /openai/v1/responses/{id}/cancel` stops it: the running tool or LLM round is cancelled, the items in progress are recorded as they stand, and the turn ends `cancelled`. Every watcher's stream ends there, with no closing event, so read the session for the final state;
+  - a turn that has ended answers `404 not_found` on both: the hub keeps finished turns only in sessions. A hub restart ends every turn.
 - **Images in:** `input_image` with a data URL, in JPEG, PNG or WebP. Convert HEIC first, and downscale large photos. Other URLs are unavailable to the model.
 - **Images out:** `image_generation_call` items carry `result` (base64), `output_format`, `action` (`generate` or `edit`) and `revised_prompt` (the prompt the model wrote). Send them back with `"result": null`: the hub finds the image, and the call that made it, by its id. They are JPEG at quality 95: the hub asks the image server for that (`IMAGE_OUTPUT` in `tools/images.py`) and converts nothing itself. The server's default, an uncompressed PNG, is ten times the size.
 - **Reasoning:** a thinking model's reasoning arrives as a `reasoning` item. It's never sent back to the model.
@@ -322,7 +331,12 @@ curl -N -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
 
 ### Sessions
 
-The hub keeps a record of every chat that names itself: a Responses request with `metadata.session_id` (a UUID, any case) is recorded in that chat's session. Without one, the turn runs as before and nothing is recorded; a `session_id` that isn't a UUID string answers `400 invalid_request`. Refused requests (401, 400, 404, 503) write nothing, and `/openai/v1/chat/completions` is never recorded. The user comes from the token: a user's devices share a session, and two users never do.
+The hub records every chat that names a `conversation`: a UUID string, or `{"id": "<UUID>"}`, in any case; the hub uses its lower-case form as the folder name. It creates the session on first use; there is no "create conversation" route. The user comes from the token. `/openai/v1/chat/completions` is never recorded.
+
+- **Incognito:** without `conversation`, the turn runs as before and nothing is written under `sessions/`. Its images still go to the shared `files/` store, because later turns replay them by id.
+- **First turn** (no `conversation.jsonl` yet): the request's input is the whole conversation, and it is all recorded. That covers a new chat and a chat older than sessions.
+- **Later turns:** the hub puts the session's history (below) before the request's input, so the client sends only the new message.
+- Either way, the turn's input is recorded exactly as sent.
 
 ```
 <config folder>/sessions/<user id>/<session id, lower case>/
@@ -332,23 +346,65 @@ The hub keeps a record of every chat that names itself: a Responses request with
 ```
 
 - **`session.json`:** `created_at` is the time of the first line and never changes; `updated_at` is the time of the last line. Times are UTC with milliseconds, as in the logs. The file is rewritten atomically after every line.
-- **`conversation.jsonl`:** `{"timestamp", "request", "type", "payload"}`, appended and never rewritten. `request` is the response id, as in the logs, so a turn's lines group by it.
+- **`conversation.jsonl`:** `{"timestamp", "request", "type", "payload"}`, appended and never rewritten. `request` is the response id, as in the logs, so a turn's lines group by it. Because `turn_started` carries the input, a turn splits cleanly into input and output.
 
 | `type` | `payload` |
 | --- | --- |
-| `turn_started` | `model` (after `agora` is resolved) and `instructions` (`null` when there are none) |
-| `response_item` | a Responses item, verbatim, except that a bare `{"role", "content"}` gets `"type": "message"` and images are swapped for links (below) |
+| `turn_started` | `model` (after `agora` is resolved), `instructions` (`null` when there are none) and `input`: the turn's input items as sent, images swapped (below). A string input becomes one user message. |
+| `response_item` | an output item: each one when it's done, plus the unfinished ones, as they stand, when a turn ends early |
 | `tool_call` | `call` (the hub's 32-hex call id, also the stem of `ig_`/`wi_` ids and generated files), `name`, `arguments` (the model's JSON string) |
 | `tool_output` | `call`, `output` (the full text the model read, `null` on an error), `error`, `files` (the file names it made or looked at) |
 | `turn_ended` | `status`, `error` |
 
-- **New input items.** The first time the hub writes to a session, every input item is new (so a chat older than this feature is recorded whole); after that, only the items after the last one the hub made (`reasoning`, `web_search_call`, `image_generation_call`, `web_image_call`, `function_call` or an `assistant` message). A message resent after a failed turn is recorded again. Each output item is recorded when it's done, and each hub tool, `view_image` included, gets a `tool_call` and a `tool_output`.
-- **Images.** No base64 is written. A photo part becomes `{"type": "input_image", "image_url": null, "file": "<name>"}`, and an image item gets `"result": null, "file": "<name>"` (`null` when the hub has no such image). Each file is a relative symlink, `files/<name> -> ../../../../files/<name>`, so it reads both in the container and on the host.
-- **End statuses:** `completed`, `incomplete` or `failed` (the response's own, with its error message), `failed` also when the first LLM round can't be reached or answers an error, and `disconnected` when the client left first; unfinished output items are recorded first, as they stand, with `status: "in_progress"`.
+- **Items** are verbatim, except that a bare `{"role", "content"}` gets `"type": "message"` and images are swapped. No base64 is written. A photo part becomes `{"type": "input_image", "image_url": null, "file": "<name>"}`, and an image item gets `"result": null, "file": "<name>"` (`null` when the hub has no such image). Each file is a relative symlink, `files/<name> -> ../../../../files/<name>`, so it reads both in the container and on the host.
+- **End statuses** (`turn_ended`): `completed`, `incomplete` or `failed` (the response's own, with its error message), `failed` also when the first LLM round can't be reached or answers an error; `cancelled` (Stop); `interrupted` (a clean hub shutdown); and `disconnected`, when the client that started a turn without `background` left. Unfinished output items are recorded first, as they stand, with `status: "in_progress"`.
+- **Read back,** a turn's `status` is one of those, or `in_progress` while it runs. A turn with no end line that isn't running is `interrupted` too: the hub crashed mid-turn. Nothing is deleted: its finished items are kept, and the half-made ones were never written.
 
-Read a session with `docker exec agora-hub ls -R /config/sessions`, or on the host with `jq -c '[.timestamp, .type]' ~/.config/agora/agora-hub/sessions/<user id>/<session id>/conversation.jsonl`.
+Three routes read your chats back. All three need the token and show only the token user's chats.
 
-Sessions hold whole chats, and their links reach every photo. Nothing is ever cleaned up. Each session's folder and its `files/` are mode 700, inside the private config folder.
+- **`GET /agora/v1/sessions`:** your chats, newest `updated_at` first. Each is its `session.json` plus `running`: the id of the turn that is running, or `null`.
+
+  ```json
+  {"data": [{"id": "8b1e6c2a-…", "user_id": "75e0ed3d-…", "created_at": "2026-11-26T11:49:01.276Z",
+             "updated_at": "2026-11-26T11:52:10.004Z", "running": "resp_ad46…"}]}
+  ```
+
+- **`GET /agora/v1/sessions/{id}`:** one chat, turn by turn. Items are as recorded: images are `file` names, and there is never base64. A running turn's `output` holds only the items finished so far. To watch the rest, rejoin it with `GET /openai/v1/responses/{running}?stream=true`, which replays the whole output from the start.
+
+  ```json
+  {"id": "8b1e6c2a-…", "user_id": "75e0ed3d-…", "created_at": "…", "updated_at": "…", "running": null,
+   "turns": [{"id": "resp_068d…", "started_at": "…", "status": "completed", "error": null,
+              "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "draw a fox"},
+                                                                      {"type": "input_image", "image_url": null, "file": "59ff….jpg"}]}],
+              "output": [{"type": "message", …}, {"type": "image_generation_call", "id": "ig_ef3f…", "result": null, "file": "ef3f….png", …}]}]}
+  ```
+
+- **`GET /agora/v1/sessions/{id}/files/{name}`:** one of the chat's images, with its media type. It is served only if `name` is linked in that chat's `files/`; otherwise `404 not_found`.
+
+  ```sh
+  curl -o fox.png -H "Authorization: Bearer $TOKEN" http://localhost:8888/agora/v1/sessions/<id>/files/<name>
+  ```
+
+Who may see what:
+
+| Request | Yours | Another user's | Doesn't exist |
+| --- | --- | --- | --- |
+| `POST /openai/v1/responses` with `conversation` | runs (or `409` while busy) | `403 forbidden` | created on first use |
+| `GET /openai/v1/responses/{id}`, `…/cancel` | works while running | `403 forbidden` | `404 not_found` (also once ended) |
+| `GET /agora/v1/sessions/{id}`, `…/files/{name}` | works | `403 forbidden` | `404 not_found` (also for an id that isn't a UUID) |
+
+"Another user's" means that the id is in another user's folder, or that the turn was started with another user's token. A refused request writes nothing.
+
+**The history the model gets:** for each recorded turn, in order, its input, then its output.
+
+- Each photo's `file` goes back to the photo itself, from the shared `files/`. A `file: null` part stays as it is, and the model gets "[image unavailable]".
+- Everything else goes through as if the client had sent it: image items replay by their `ig_`/`wi_` ids; reasoning, searches and unfinished image items are skipped; a stopped reply's partial text counts as a reply.
+- `tool_call` and `tool_output` lines are only a record. They are not part of the history.
+- So what a client shows from `GET /agora/v1/sessions/{id}` is exactly what the model sees.
+
+Read a session by hand with `docker exec agora-hub ls -R /config/sessions`, or on the host with `jq -c '[.timestamp, .type]' ~/.config/agora/agora-hub/sessions/<user id>/<session id>/conversation.jsonl`.
+
+Sessions hold whole chats, and their links reach every photo. They are never cleaned up. Incognito turns leave only their images in `files/`. Each session's folder and its `files/` are mode 700, inside the private config folder.
 
 ### Web research through Responses
 
@@ -408,40 +464,35 @@ Run `uv run pytest -q` for tests. Browser tests require the matching Playwright 
 
 ### Research runtime, limits and diagnosis
 
-The hub owns a lazily started Playwright Chromium process, at most two isolated response contexts and one active tab per response. There is no persistent profile or cross-response cookie history. Contexts/tabs close at completion, failure or disconnect; the owned browser closes after 300 idle seconds by default and on hub shutdown. A bounded queue consumes the action deadline. Browser navigation waits for DOM content and a short settling interval; it does not wait for every ad or background connection.
+The hub owns a lazily started Playwright Chromium process, at most two isolated response contexts and one active tab per response. There is no persistent profile or cross-response cookie history. Contexts/tabs close when the turn ends: it completes, fails, is stopped, or is disconnected (a turn without `background` whose client left); the owned browser closes after 300 idle seconds by default and on hub shutdown. A bounded queue consumes the action deadline. Browser navigation waits for DOM content and a short settling interval; it does not wait for every ad or background connection.
 
 Research permits public HTTP(S) only: embedded credentials, non-web schemes, local/private/non-public IPv4/IPv6 addresses and unsafe destination resolutions are rejected. HTTP and browser traffic use an in-process DNS-checking, numeric-address-pinning proxy, including redirects, image downloads and browser subresources. Service workers are blocked, WebSockets closed and QUIC/non-proxied WebRTC disabled. The web client is separate from gateway/upstream authorization and ignores environment proxy settings; it does not receive user bearer tokens. Queries and requested URLs still go to search engines and source websites. HTTP requests and the browser both identify themselves as `AgoraAgent/1.0 (+https://abril.me)` (`USER_AGENT` in `tools/search/loader.py`). Some sites, such as Wikipedia and its image server, reject agents without contact details, and also reject borrowed browser agents (a Safari or Chrome string) because the connection doesn't match, so the hub doesn't pretend to be a browser. Cookies/profile contents are not traced.
 
 CAPTCHAs, consent, login/paywalls, empty or faulty extraction and some JavaScript sites can remain inaccessible. There is no stealth, CAPTCHA solving, login, arbitrary JavaScript supplied by the model, general clicking, form filling, PDF/video/audio extraction, full-site crawling or background research. Following ordinary links and scrolling the current page are supported. Layout changes can break extraction. Direct image downloads/screenshots do not imply a dedicated image-search API or full-resolution gallery extraction. Unsupported image formats may be visually inspected with `web_look` if rendering works. A text-only model must not claim to have inspected pixels.
 
-Use `docker logs -f agora-hub` and correlate the `resp_` id with `tool.call`, `tool.result` and `upstream.request`. Each HTTP or browser load writes a `web.fetch` line with the response id, `mode`, access `status`, `seconds` and the URL (first 300 characters); page results include attempts and failure details. For blocked access or timeouts, check outbound connectivity, destination policy, access requirements and deadlines. For browser startup failures in Docker, rebuild/recreate the locked image and check `/opt/agora-browsers`, non-root permissions, seccomp and shared memory. For native installs, rerun the matching Playwright installation from §2. HTTP-only mode remains available while diagnosing rendering.
+Use `docker logs -f agora-hub` and correlate the `resp_` id with its `tool` lines (`name`, `seconds`, `error`). Page results, with their attempts and failure details, are in the session's `tool_output` lines, which incognito turns don't have. For blocked access or timeouts, check outbound connectivity, destination policy, access requirements and deadlines. For browser startup failures in Docker, rebuild/recreate the locked image and check `/opt/agora-browsers`, non-root permissions, seccomp and shared memory. For native installs, rerun the matching Playwright installation from §2. HTTP-only mode remains available while diagnosing rendering.
 
 ### Logs
 
-Every gateway request is logged to stdout as JSON lines: `{"time", "request", "event", …}`, one line per event. Read them with `docker logs -f agora-hub | grep --line-buffered '^{' | jq .` (uvicorn's access lines aren't JSON).
+The gateway logs to stdout as short JSON lines: `{"time", "request", "event", …}`. Read them with `docker logs -f agora-hub | grep --line-buffered '^{' | jq .` (uvicorn's access lines, one per HTTP request, aren't JSON).
 
-| Event | Logged by | Fields |
+| Event | When | Fields |
 | --- | --- | --- |
-| `request` | the gateway, each route | `endpoint` (`chat/completions` or `responses`), `body`: the client's body as received |
-| `upstream.request` | the chat route; the harness, each round | `round` (harness only), `url`, `body`: what the hub sent |
-| `upstream.response` | same | `round` (harness only), `status`, and either `message` (a streamed reply, collected into one assistant message: `content`, `reasoning`, `tool_calls`, `finish_reason`, `usage`) or `body` (any other reply: its JSON, or its text) |
-| `upstream.error` | same | `round` (harness only), `error`: the connection failed, or the stream broke while being read |
-| `tool.call` | the harness | `call`, `name`, `arguments` |
-| `tool.result` | the harness | `call`, `seconds`, and `content` and `images`, or `error` |
-| `response` | the Responses route | `response`: the final response object |
-| `disconnect` | the gateway | the client left; while streaming, what it got so far: `message` (chat) or `response` (Responses) |
-| `error` | the gateway | `status`, `code`, `message` of an error the hub answered |
+| `request` | each `/chat/completions` and `/responses` turn | `endpoint` (`chat/completions` or `responses`), `user` (the token's user id) |
+| `tool` | each hub tool, once it has ended | `call`, `name`, `seconds`, `error` (`null` when it worked) |
+| `error` | each error the hub answers | `status`, `code`, `message` |
 
-Request ids: chat requests get `chat_<16 hex>`, Responses requests their response id, `resp_<32 hex>`. Every line of a request carries its id; an error before the body is parsed (a bad key, a bad body) has `"request": null`.
+Request ids: chat requests get `chat_<16 hex>`, Responses requests their response id, `resp_<32 hex>`. Every line of a request carries its id; an error outside a turn's request id (a bad key, a bad body, or the read, watch and cancel routes) has `"request": null`.
 
-Images are shortened: a base64 data URL keeps its `data:…;base64,` head followed by `<N chars>`, and a long `result` or `b64_json` becomes `<N chars>`. Fields named `content`, `arguments` or `text` are limited to their first 2000 characters plus an original-length marker; exact lowercase `authorization`, `cookie` and `set-cookie` fields are redacted. This is bounded field logging, not blanket URL/secret redaction: search queries, page excerpts, source/image URLs and URL query strings can appear in request/tool/upstream traces, and other fields may remain complete. Treat the host's Docker logs as sensitive. Docker keeps 5 × 20 MB per container, and each `make deploy` starts a fresh log.
+The logs no longer hold what was said: no request or reply bodies, no tool arguments or results, no fetched pages. Whatever of that a chat needs, its session holds. They still name users and tools, so treat the host's Docker logs as sensitive. Docker keeps 5 × 20 MB per container, and each `make deploy` starts a fresh log.
 
 APIs the gateway doesn't serve yet: a coding agent that needs one (Codex needs Responses features the hub doesn't have) can use a deployment's own endpoint directly. That endpoint has no token check and no `agora` alias.
 
 Planned (not built yet):
 
-- **Stored responses and resumable runs:** `store` and `previous_response_id`, plus `background` turns that the client can resume by response id and the last `sequence_number` it got, or cancel.
+- **Stored responses:** `store` and `previous_response_id`.
 - **Partial images** while generating, once the image server streams them.
 - **Codex** on `/openai/v1/responses`: custom and shell tool types, and encrypted reasoning.
 - **Anthropic Messages** at `/anthropic/v1`, through the same harness.
-- **Sessions for every device.** List and fetch a user's sessions, resume a chat on another device, and keep a turn running after the client leaves.
+- **Chats from other devices:** list a user's chats on any device, and resume one there.
+- **Turns that survive a hub restart.**

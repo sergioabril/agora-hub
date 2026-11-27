@@ -1,6 +1,5 @@
 import asyncio
 import gzip
-import json
 
 import httpx
 import pytest
@@ -159,21 +158,6 @@ async def test_unsupported_document_is_honest_snapshot_without_browser():
             page,attempts = await loader.load(object(),'https://example.org/paper.pdf',mode)
             assert page.status == 'unsupported' and page.final_url.endswith('/paper.pdf')
             assert attempts == [{'mode':'http','status':'unsupported','detail':'Unsupported document content type: application/pdf'}]
-    finally:
-        await loader.close()
-
-
-async def test_browser_logging_includes_duration_and_access_status(capsys):
-    from agora_hub.tools.search.reader import extract
-    class FakeBrowser:
-        async def load(self,state,url):
-            return extract('<main>'+ 'Original source evidence. '*20+'</main>',url,url,'browser')
-        async def close(self): pass
-    loader = Loader(browser=FakeBrowser())
-    try:
-        await loader.load(object(),'https://example.org','browser')
-        line = json.loads(capsys.readouterr().out.splitlines()[-1])
-        assert (line['event'], line['mode'], line['status']) == ('web.fetch', 'browser', 'content') and 'seconds' in line
     finally:
         await loader.close()
 

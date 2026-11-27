@@ -8,12 +8,11 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .harness import Delta, Failed, Finished, Harness, KeepAlive, ToolFinished, ToolStarted
 from .tools import FILES_PATH, MADE, FileStore
-from .trace import trace
 
-UNSUPPORTED = ("previous_response_id", "conversation", "background")
+UNSUPPORTED = ("previous_response_id",)
 HUB_TOOLS = {"web_search", "web_search_preview", "image_generation"}  # the hub's own tools are on anyway
 FORMATS = {"png": "png", "jpg": "jpeg", "webp": "webp"}
-HUB_ITEMS = {"reasoning", "web_search_call", "image_generation_call", "web_image_call", "function_call"}
+STREAM_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 ECHOED = {"instructions": None, "tools": [], "tool_choice": "auto", "parallel_tool_calls": True, "temperature": None,
           "top_p": None, "max_output_tokens": None, "metadata": {}}
 
@@ -96,16 +95,18 @@ def _item(item: dict, messages: list[dict], store: FileStore):
         raise BadRequest(f"input item type {kind} is not supported")
 
 
-def chat_request(body: dict, store: FileStore) -> dict:
+def chat_request(body: dict, store: FileStore, history: list[dict]) -> dict:
+    """The request as a chat completion. history is the session's recorded chat, which goes before the input."""
     for field in UNSUPPORTED:
         if body.get(field):
-            raise BadRequest(f"{field} is not supported; send the whole conversation in input", "unsupported_parameter")
+            raise BadRequest(f"{field} is not supported; send the whole conversation in input, or name it with conversation",
+                             "unsupported_parameter")
     items = body.get("input")
     items = [{"role": "user", "content": items}] if isinstance(items, str) else items
     if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
         raise BadRequest("input must be a string or a list of items")
     messages = [{"role": "system", "content": body["instructions"]}] if isinstance(body.get("instructions"), str) else []
-    for item in items:
+    for item in [*history, *items]:
         _item(item, messages, store)
     chat = {"model": body["model"], "messages": messages}
     tools = []  # the client's function tools; the harness adds its own
@@ -126,12 +127,6 @@ def chat_request(body: dict, store: FileStore) -> dict:
         if body.get(key) is not None:
             chat[chat_key] = body[key]
     return chat
-
-
-def new_items(items: list[dict]) -> list[dict]:
-    """The items after the last one the hub made: what the client added since its previous turn."""
-    made = [index for index, item in enumerate(items) if item.get("type") in HUB_ITEMS or item.get("role") == "assistant"]
-    return items[made[-1] + 1:] if made else items
 
 
 class Render:
@@ -286,30 +281,96 @@ class Render:
         return [*out, self.send("response.failed", response=self.response)]
 
 
-async def _rendered(harness: Harness, turn, render: Render, request_id: str, stream: bool):
-    events = harness.events(turn)
-    status = "failed"  # until the turn ends one way or another
-    try:
-        for text in render.start():
-            yield text
-        async for event in events:
-            for text in render.handle(event):
-                yield text
-        trace(request_id, "response", response=render.response)
-        status = render.response["status"]
-    except (asyncio.CancelledError, GeneratorExit):
-        status = "disconnected"
-        if stream:  # the gateway's race helper logs a non-streaming disconnect
-            trace(request_id, "disconnect", response=render.response)
-        raise
-    finally:
-        render.end(status)
-        await events.aclose()  # cancels a running tool and closes the LLM response
-        await harness.cleanup(turn)  # also covers leaving before the event iterator starts
+class Job:
+    """One Responses turn, run as its own task. It keeps its events, so any connection can watch it from the start.
+    A watcher leaving doesn't stop it; cancel() does, and so does the first watcher leaving a turn without background."""
+
+    def __init__(self, harness: Harness, render: Render, chat: dict, url: str, user_id: str, background: bool):
+        self.harness, self.render, self.response, self.session = harness, render, render.response, render.session
+        self.user_id, self.background = user_id, background
+        self.events = []  # the turn's events so far: events[n] has sequence_number n
+        self.changed = asyncio.Event()  # set, then replaced, whenever events grow or the turn ends
+        self.started = asyncio.get_running_loop().create_future()  # set once the first LLM round is over: its error or None
+        self.ending = None  # why cancel() stopped the turn
+        self.done = False
+        self.task = asyncio.create_task(self.run(chat, url))
+
+    async def run(self, chat: dict, url: str):
+        try:
+            turn = await self.harness.start(chat, url, self.response["id"])
+        except asyncio.CancelledError:
+            self.end(self.ending)
+            raise
+        except Exception as error:  # the request answers it with its own status (502, or the upstream's)
+            self.started.set_result(error)
+            self.end("failed", str(error))
+            return
+        self.started.set_result(None)
+        events = self.harness.events(turn)
+        status = "failed"  # until the turn ends one way or another
+        try:
+            self.add(self.render.start())
+            async for event in events:
+                self.add(self.render.handle(event))
+            status = self.response["status"]
+        except asyncio.CancelledError:
+            status = self.ending
+            raise
+        finally:
+            self.end(status)
+            await events.aclose()  # cancels a running tool and closes the LLM response
+            await self.harness.cleanup(turn)
+
+    def end(self, status: str, error: str | None = None):
+        """Records how the turn ended, and lets the request and every watcher go."""
+        self.render.end(status, error)
+        self.done = True
+        if not self.started.done():
+            self.started.set_result(None)  # stopped before its first round: the request gets what there is
+        self.wake()
+
+    def cancel(self, status: str):
+        """Stops the turn: Stop ("cancelled"), the first watcher leaving a turn without background ("disconnected"),
+        or the hub shutting down ("interrupted")."""
+        if self.done:
+            return
+        self.ending = status
+        if status == "cancelled":
+            self.response["status"] = "cancelled"  # what the cancel route answers, as OpenAI's does
+        self.task.cancel()
+
+    def add(self, texts: list[str]):
+        """Keeps the turn's new events and wakes its watchers. Keep-alives aren't kept: every watcher sends its own."""
+        self.events += [text for text in texts if not text.startswith(":")]
+        self.wake()
+
+    def wake(self):
+        self.changed.set()  # wakes every watcher waiting on this event…
+        self.changed = asyncio.Event()  # …and the next wait starts on a fresh one
+
+    async def watch(self, after: int = -1, stops: bool = False):
+        """Yields the turn's events after sequence number `after`, then follows it live until it ends.
+        stops: this watcher leaving stops the turn (the request that started it, without background)."""
+        sent = after + 1
+        try:
+            while True:
+                while sent < len(self.events):
+                    yield self.events[sent]
+                    sent += 1
+                if self.done:
+                    return
+                try:
+                    await asyncio.wait_for(self.changed.wait(), 10)
+                except TimeoutError:
+                    yield ": keep-alive\n\n"
+        finally:
+            if stops:
+                self.cancel("disconnected")
 
 
-async def respond(harness: Harness, store: FileStore, body: dict, url: str, request_id: str, session=None) -> Response:
-    chat = chat_request(body, store)
+def start(harness: Harness, store: FileStore, body: dict, url: str, request_id: str, user_id: str, session=None) -> Job:
+    """Starts the turn as a job. With a session, the chat it has recorded goes before the request's input."""
+    chat = chat_request(body, store, session.history() if session else [])
     response = {"id": request_id, "object": "response", "created_at": int(time.time()), "status": "in_progress",
                 "model": body["model"], "output": [], "error": None, "incomplete_details": None,
                 **{key: body.get(key, default) for key, default in ECHOED.items()},
@@ -317,21 +378,24 @@ async def respond(harness: Harness, store: FileStore, body: dict, url: str, requ
     render = Render(response, store, session)
     if session:
         items = body["input"] if isinstance(body["input"], list) else [{"role": "user", "content": body["input"]}]
-        render.record("turn_started", {"model": body["model"], "instructions": body.get("instructions")})
-        for item in items if session.new else new_items(items):
-            render.record("response_item", item)
+        render.record("turn_started", {"model": body["model"], "instructions": body.get("instructions"), "input": items})
+    return Job(harness, render, chat, url, user_id, body.get("background") is True)
+
+
+async def reply(job: Job, stream: bool) -> Response:
+    """The request's answer. It waits for the first LLM round, whose errors keep their HTTP status."""
     try:
-        turn = await harness.start(chat, url, request_id)
-    except asyncio.CancelledError:
-        render.end("disconnected")
+        await asyncio.wait({job.started})  # not `await job.started`: cancelling that would cancel the future too
+        error = job.started.result()
+        if error:
+            raise error
+        if stream:
+            return StreamingResponse(job.watch(stops=not job.background), headers=STREAM_HEADERS,
+                                     media_type="text/event-stream")
+        if not job.background:
+            await asyncio.wait({job.task})
+        return JSONResponse(job.response)
+    except asyncio.CancelledError:  # the client left: the gateway's race cancels this
+        if not job.background:
+            job.cancel("disconnected")
         raise
-    except Exception as error:
-        render.end("failed", str(error))
-        raise
-    chunks = _rendered(harness, turn, render, request_id, body.get("stream") is True)
-    if body.get("stream") is True:
-        return StreamingResponse(chunks, headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                                 media_type="text/event-stream")
-    async for _ in chunks:
-        pass
-    return JSONResponse(response)

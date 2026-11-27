@@ -2,29 +2,12 @@ import json
 from datetime import datetime, timezone
 
 
-def _short(value, key=None):
-    if isinstance(value, dict):
-        return {k: _short(v, k) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_short(v) for v in value]
-    if isinstance(value, str):
-        if value.startswith("data:") and ";base64," in value:
-            return f"{value[:value.index(',') + 1]}<{len(value)} chars>"
-        if key in ("authorization", "cookie", "set-cookie"):
-            return "<redacted>"
-        if key in ("content", "arguments", "text") and len(value) > 2000:
-            return value[:2000] + f"… <{len(value)} chars>"
-        if key in ("result", "b64_json") and len(value) > 100:
-            return f"<{len(value)} chars>"
-    return value
-
-
 def timestamp() -> str:
     """Now in UTC, to the millisecond: 2026-11-26T11:41:05.123Z."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def trace(request_id: str | None, event: str, **fields):
-    """Prints one JSON line to stdout: the conversation log."""
-    line = {"time": timestamp(), "request": request_id, "event": event, **_short(fields)}
+    """Prints one short JSON line to stdout: who called and which tools ran. Conversations live in sessions/."""
+    line = {"time": timestamp(), "request": request_id, "event": event, **fields}
     print(json.dumps(line, ensure_ascii=False), flush=True)

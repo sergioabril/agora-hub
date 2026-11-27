@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from agora_hub.harness import Harness
-from agora_hub.responses import chat_request, respond
+from agora_hub.responses import chat_request, reply, start
 from agora_hub.tools import ToolOutput
 from agora_hub.tools.images import spec
 from tests.test_gateway import PNG, sse, sse_events, tool_call, upstream
@@ -45,7 +45,7 @@ async def test_structured_progress_inspection_and_published_image(tmp_path, stre
                              sse(tool_call('show_web_image', image='p1:i1')), sse({'content': 'Checked answer.\n\nSources: https://example.org/article'})]
     async with httpx.AsyncClient(transport=upstream(requests, replies)) as http:
         harness = Harness(http, tools, tools.store)
-        response = await respond(harness, tools.store, {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r')
+        response = await reply(start(harness, tools.store, {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r', 'u'), stream)
         if stream:
             chunks = ''.join([chunk async for chunk in response.body_iterator])
             events = sse_events(chunks)
@@ -64,7 +64,7 @@ async def test_structured_progress_inspection_and_published_image(tmp_path, stre
     assert shown['source_page_url'] == 'https://example.org/article'
     assert shown['image_url'] == 'https://example.org/image.png'
     replay = chat_request({'model': 'm', 'input': [{'type': 'web_image_call', 'id': shown['id'], 'status': 'completed', 'result': None},
-                                                {'role': 'user', 'content': 'edit this'}]}, tools.store)
+                                                {'role': 'user', 'content': 'edit this'}]}, tools.store, [])
     assert replay['messages'][0]['tool_calls'][0]['function']['name'] == 'show_web_image'
     assert 'Source: https://example.org/article' in replay['messages'][1]['content']
     # Stored replay preserves normal image labels and supplies pixels to later editing.
@@ -84,8 +84,8 @@ async def test_failed_progress_explicit_error(tmp_path, stream, name):
     tools = registry(tmp_path)
     tools.groups[1].schemas = [*Group.schemas, spec('show_web_image', 'Show image')]
     async with httpx.AsyncClient(transport=upstream([], [sse(tool_call(name)), sse({'content': 'Cannot establish it.'})])) as http:
-        response = await respond(Harness(http, tools, tools.store), tools.store,
-                                 {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r')
+        response = await reply(start(Harness(http, tools, tools.store), tools.store,
+                                     {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r', 'u'), stream)
         if stream:
             events = sse_events(''.join([chunk async for chunk in response.body_iterator]))
             assert any(e['type'] == ('response.web_image_call.failed' if name == 'show_web_image' else 'response.web_search_call.failed') for e in events)
@@ -149,8 +149,8 @@ async def test_real_search_group_http_progress_image_and_offline_replay(tmp_path
                sse({'content': 'Checked evidence.\n\nSources:\n- https://example.org/article'})]
     try:
         async with httpx.AsyncClient(transport=upstream([], replies)) as http:
-            response = await respond(Harness(http, tools, tools.store), tools.store,
-                                     {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r')
+            response = await reply(start(Harness(http, tools, tools.store), tools.store,
+                                         {'model': 'm', 'input': 'research', 'stream': stream}, 'http://llm', 'r', 'u'), stream)
             result = sse_events(''.join([s async for s in response.body_iterator]))[-1]['response'] if stream else json.loads(response.body)
         assert result['status'] == 'completed'
         assert [i['status'] for i in result['output']] == ['completed'] * 5
@@ -160,7 +160,7 @@ async def test_real_search_group_http_progress_image_and_offline_replay(tmp_path
         assert shown['type'] == 'web_image_call' and shown['source_page_url'] == 'https://example.org/article'
         assert shown['result'] == base64.b64encode(png).decode()
         assert fetched == ['https://html.duckduckgo.com/html/?q=facts','https://example.org/article', 'https://example.org/photo.png']
-        replay = chat_request({'model': 'm', 'input': [{'type': 'web_image_call', 'id': shown['id'], 'status': 'completed'}]}, tools.store)
+        replay = chat_request({'model': 'm', 'input': [{'type': 'web_image_call', 'id': shown['id'], 'status': 'completed'}]}, tools.store, [])
         assert replay['messages'][0]['tool_calls'][0]['function']['name'] == 'show_web_image'
         assert 'https://example.org/photo.png' in replay['messages'][1]['content']
         replay['messages'].append({'role': 'user', 'content': 'Make the found image blue.'})

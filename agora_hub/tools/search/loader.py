@@ -10,7 +10,6 @@ from dataclasses import replace
 import ipaddress
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 import socket
-import time
 import zlib
 from urllib.parse import urlsplit
 
@@ -18,7 +17,6 @@ import httpx
 import anyio
 from bs4 import UnicodeDammit
 
-from ...trace import trace
 from .reader import extract
 
 HTML_CAP = 5 * 1024 * 1024
@@ -457,7 +455,6 @@ class Loader:
         attempts = []
         page = None
         if mode != "browser":
-            started = time.monotonic()
             try:
                 data, final, code, mime, charset = await self.fetch(url)
                 # The header's charset wins; otherwise the page's <meta charset>, then UTF-8, then Windows-1252.
@@ -473,31 +470,22 @@ class Loader:
                 attempts.append({"mode":"http", "status":"unsupported", "detail":str(exc)[:300]})
             except (AccessError, httpx.HTTPError, OSError, TimeoutError) as exc:
                 attempts.append({"mode":"http", "status":"error", "detail":str(exc)[:300]})
-            self._trace(state, url, attempts[-1]["status"], "http", started)
             if page and (page.status in ("content", "unsupported") or mode == "http"):
                 return page, attempts
         if mode != "http" and self.browser_enabled:
             try:
-                started = time.monotonic()
                 page = await self.browser.load(state, url)
                 attempts.append({"mode":"browser", "status":page.status})
-                self._trace(state, url, page.status, "browser", started)
                 return page, attempts
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 attempts.append({"mode":"browser", "status":"error", "detail":str(exc)[:300]})
-                self._trace(state, url, "error", "browser", started)
         elif mode == "browser":
             raise AccessError("Browser rendering is disabled")
         if page:
             return replace(page, detail=str(attempts)[-700:]), attempts
         raise AccessError("Loading failed: " + str(attempts)[-1000:])
-
-    @staticmethod
-    def _trace(state, url, status, mode, started):
-        trace(getattr(state, "request_id", None), "web.fetch", mode=mode, status=status,
-              seconds=round(time.monotonic() - started, 3), url=url[:300])
 
     async def cleanup(self, state):
         await self.browser.cleanup(state)

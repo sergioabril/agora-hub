@@ -12,16 +12,23 @@ DATA_URL = re.compile(r"data:image/[\w.+-]+;base64,(.*)", re.S)
 IMAGE_ITEMS = {"image_generation_call": "ig_", "web_image_call": "wi_"}  # item type -> id prefix before the file stem
 
 
+def owner(root: Path, session_id: str) -> str | None:
+    """The id of the user whose folder holds this session, or None while nobody has it.
+    session_id is a canonical UUID, so it holds no glob patterns."""
+    return next((folder.parent.name for folder in root.glob(f"*/{session_id}")), None)
+
+
 class Session:
     def __init__(self, root: Path, user_id: str, session_id: str, store: FileStore):
         self.id, self.user_id, self.store = session_id, user_id, store
         self.folder = root / user_id / session_id
         self.files = self.folder / "files"
-        self.new = not (self.folder / "conversation.jsonl").exists()  # the hub has never written to this session
 
     def log(self, request_id: str, kind: str, payload: dict):
         """Appends one line to conversation.jsonl and moves session.json's updated_at to its time."""
         self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if kind == "turn_started":
+            payload = {**payload, "input": [self._item(item) for item in payload["input"]]}
         if kind == "response_item":
             payload = self._item(payload)
         if kind == "tool_output":
@@ -36,6 +43,45 @@ class Session:
         tmp = self.folder / "session.json.tmp"
         tmp.write_text(json.dumps({"id": self.id, "user_id": self.user_id, "created_at": created_at, "updated_at": time}))
         os.replace(tmp, header)
+
+    def turns(self, running: str | None = None) -> list[dict]:
+        """The log read back turn by turn: what was sent, what came back and how it ended.
+        A turn with no end line that isn't running was cut short by the hub stopping: it is interrupted."""
+        path = self.folder / "conversation.jsonl"
+        if not path.is_file():
+            return []
+        turns = []
+        for text in path.read_text().splitlines():
+            line = json.loads(text)
+            payload = line["payload"]
+            if line["type"] == "turn_started":
+                turns.append({"id": line["request"], "started_at": line["timestamp"], "status": "interrupted",
+                              "error": None, "input": payload["input"], "output": []})
+            elif line["type"] == "response_item":
+                turns[-1]["output"].append(payload)
+            elif line["type"] == "turn_ended":
+                turns[-1].update(status=payload["status"], error=payload["error"])
+        if turns and turns[-1]["id"] == running:
+            turns[-1]["status"] = "in_progress"
+        return turns
+
+    def history(self) -> list[dict]:
+        """The chat so far, as the model's input items: every turn's input, then its output, photos restored."""
+        items = []
+        for turn in self.turns():
+            items += turn["input"] + turn["output"]
+        return [self._restored(item) for item in items]
+
+    def _restored(self, item: dict) -> dict:
+        """The item with each photo's file swapped back for the photo itself, as the client first sent it."""
+        if not isinstance(item.get("content"), list):
+            return item
+        parts = []
+        for part in item["content"]:
+            if part.get("file") and self.store.path(part["file"]):
+                part = {**part, "image_url": self.store.data_url(part["file"])}
+            parts.append(part)
+        return {**item, "content": parts}
 
     def _item(self, item: dict) -> dict:
         """The item with its type, and each base64 image swapped for null plus the name of its link in files/."""

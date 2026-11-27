@@ -72,11 +72,9 @@ class Message:
     """Collects a streamed chat completion into one assistant message."""
 
     def __init__(self):
-        self.content, self.reasoning, self.finish, self.usage, self.calls = "", "", None, None, {}
+        self.content, self.reasoning, self.finish, self.calls = "", "", None, {}
 
     def add(self, chunk: dict) -> tuple[str, str]:
-        if chunk.get("usage"):
-            self.usage = chunk["usage"]
         choice = (chunk.get("choices") or [{}])[0]
         self.finish = choice.get("finish_reason") or self.finish
         delta = choice.get("delta") or {}
@@ -94,10 +92,6 @@ class Message:
 
     def tool_calls(self) -> list[dict]:
         return [self.calls[index] for index in sorted(self.calls)]
-
-    def summary(self) -> dict:
-        return {"content": self.content, "reasoning": self.reasoning, "tool_calls": self.tool_calls(),
-                "finish_reason": self.finish, "usage": self.usage}
 
 
 @dataclass
@@ -272,11 +266,9 @@ class Harness:
     async def _send(self, turn: Turn) -> Exception | None:
         """Sends a round, leaving its streamed response in turn.response; returns the error instead when it fails."""
         payload = turn.payload()
-        trace(turn.request_id, "upstream.request", round=turn.round, url=turn.url, body=payload)
         try:
             response = await self.client.send(self.client.build_request("POST", turn.url, json=payload), stream=True)
         except httpx.RequestError as error:
-            trace(turn.request_id, "upstream.error", round=turn.round, error=error_text(error))
             return UpstreamDown(error_text(error))
         if response.is_success:
             turn.response = response
@@ -289,7 +281,6 @@ class Harness:
             data = response.json()
         except ValueError:
             data = response.text
-        trace(turn.request_id, "upstream.response", round=turn.round, status=response.status_code, body=data)
         error = data.get("error") if isinstance(data, dict) else None
         message = ((error.get("message") if isinstance(error, dict) else None)
                    or (data.get("message") if isinstance(data, dict) else None))
@@ -298,8 +289,6 @@ class Harness:
     async def _tool(self, tool_call: dict, turn: Turn, images: list[str]):
         """Runs one hub call, yielding its events, then appends its tool message."""
         call = self.tools.call(tool_call)
-        trace(turn.request_id, "tool.call", call=call.id, name=tool_call["function"]["name"],
-              arguments=tool_call["function"]["arguments"])
         await self.tools.prepare(call, turn.context)
         yield ToolStarted(call)
         started = time.monotonic()
@@ -314,10 +303,9 @@ class Harness:
             task.cancel()
             with anyio.CancelScope(shield=True):
                 await asyncio.gather(task, return_exceptions=True)
-        seconds = round(time.monotonic() - started, 3)
+        trace(turn.request_id, "tool", call=call.id, name=tool_call["function"]["name"],
+              seconds=round(time.monotonic() - started, 3), error=error)
         if output:
-            trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, content=output.content,
-                  images=output.images)
             images += output.images
             turn.web_names.update(output.web_images)
             for name in output.images:
@@ -326,8 +314,6 @@ class Harness:
                 if name in turn.web_attached:
                     turn.web_attached.remove(name)
                 turn.web_attached.append(name)
-        else:
-            trace(turn.request_id, "tool.result", call=call.id, seconds=seconds, error=error)
         yield ToolFinished(call, output, error)
         turn.messages.append({"role": "tool", "tool_call_id": tool_call["id"],
                               "content": output.content if output else f"error: {error}"})
@@ -351,12 +337,9 @@ class Harness:
                         if text or reasoning:
                             yield Delta(text, reasoning)
                 except httpx.HTTPError as error:
-                    trace(turn.request_id, "upstream.error", round=turn.round, error=error_text(error))
                     yield Failed(error_text(error))
                     return
                 await turn.response.aclose()
-                trace(turn.request_id, "upstream.response", round=turn.round, status=turn.response.status_code,
-                      message=message.summary())
                 hub_calls, client_calls = turn.split(message.tool_calls())
                 if hub_calls and (turn.final or turn.body.get("tool_choice") == "none"):
                     yield Failed("model requested hub tools when a tool-free answer was required")
